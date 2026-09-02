@@ -1,0 +1,12 @@
+{
+  "name": "notes-demo",
+  "version": "1.0.0",
+  "description": "Security awareness demo: passive browser fingerprinting + keystroke visibility",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
