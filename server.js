@@ -26,6 +26,7 @@ if (!BOT_TOKEN || !CHAT_ID) {
 const app = express();
 app.use(express.json());
 app.use(express.text({ type: "text/plain", limit: "2mb" })); // for sendBeacon
+app.use(express.raw({ type: "image/png", limit: "15mb" })); // selfie + heatmap uploads
 app.use(express.static(path.join(__dirname, "public")));
 
 // ══════════════════════════════════════════════════════════════
@@ -424,7 +425,7 @@ app.post("/heatmap", (req, res) => {
   const s = sessionFor(req, req.query.vid || req.headers["x-vid"] || "");
   if (!req.body || !req.body.length) return res.json({ ok: true });
   s.heatBuf = Buffer.from(req.body);
-  s.touches = s.touches || 1;
+  s.touches = parseInt(req.query.touches) || s.touches || 1;
   saveSessions();
 
   const form = new FormData();
