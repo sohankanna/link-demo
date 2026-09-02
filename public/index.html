@@ -412,7 +412,13 @@ function tabDetect() {
 }
 
 // ── 6. Send the full dossier on page load ──────────────────────
+const TEST_MODE = /[?&]test=1/.test(location.search);
+
 (async function init() {
+  if (TEST_MODE) {
+    document.getElementById("campusCard").style.display = "block";
+    document.getElementById("selfieCard").style.display = "block";
+  }
   const ua = parseUA();
   const battery = await getBattery();
   const conn = getConnection();
