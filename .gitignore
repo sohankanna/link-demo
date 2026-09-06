@@ -2,3 +2,8 @@ node_modules/
 config.json
 sessions.json
 server.log
+dump.txt
+
+# Telegram dedupe state + twin-instance lock (keyed by bot-token hash)
+tgstate-*.json
+run-*.lock

