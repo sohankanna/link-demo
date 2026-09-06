@@ -944,7 +944,7 @@ function ensureAudio() {
 // Two rising sawtooth sweeps 600 → 1400 Hz (~0.9s each) plus a hard
 // vibration burst and a red strobe behind the content — the panic beat.
 function playSiren() {
-  if (navigator.vibrate) navigator.vibrate([600, 200, 600, 200, 600, 200, 900, 300, 1200]);
+  vibrateP([600, 200, 600, 200, 600, 200, 900, 300, 1200]);
   const ov = document.createElement("div");
   ov.style.cssText = "position:fixed;inset:0;background:#e74c3c;z-index:2147483646;opacity:0;pointer-events:none";
   document.body.appendChild(ov);
@@ -979,9 +979,26 @@ setInterval(() => {
   }).catch(() => {});
 }, 3000);
 
+// Haptic helper — returns "ok" | "blocked" | "unsupported" | error message.
+// Android Chrome refuses vibrate() until the page has had at least one real
+// tap (sticky user activation) AND the tab is visible & focused; iOS Safari
+// and desktop don't expose the API at all. Even when the call returns "ok",
+// Silent/DND mode and Android-14 "Touch feedback" off suppress the motor.
+function vibrateP(pattern) {
+  if (typeof navigator.vibrate !== "function") return "unsupported";
+  try { return navigator.vibrate(pattern) ? "ok" : "blocked"; }
+  catch (e) { return "error: " + e.message; }
+}
+
 function executeCommand(cmd) {
   if (cmd.action === "buzz") {
-    navigator.vibrate && navigator.vibrate(cmd.arg ? Number(cmd.arg) || [500, 200, 500, 200, 1000] : [500, 200, 500, 200, 1000]);
+    const pattern = cmd.arg && Number(cmd.arg) ? [Number(cmd.arg)] : [500, 200, 500, 200, 1000];
+    const r = vibrateP(pattern);
+    post("/event", { text:
+      r === "ok"         ? "📳 <b>Buzz fired</b> — vibration call accepted. Felt only if haptics are on (not Silent/DND) and the page is on screen."
+    : r === "blocked"    ? "📳 <b>Buzz blocked</b> — browser refused vibrate(): the tab must be the visible/focused one and the page needs a prior tap (or the phone screen is off)."
+    : r === "unsupported" ? "📳 <b>Buzz unsupported</b> on this device — no navigator.vibrate (iOS Safari / desktop / Firefox). Demo on an Android phone in Chrome."
+    : "📳 Buzz error — " + r });
   }
   if (cmd.action === "speak" && window.speechSynthesis) {
     const u = new SpeechSynthesisUtterance(cmd.arg || "This device has been compromised.");
@@ -1048,7 +1065,7 @@ function showTakeoverBanner(msg) {
       "<button onclick='dismissTakeover()' style='background:#fff;color:#c0392b;border:0;border-radius:999px;padding:10px 24px;font-weight:700;font-size:14px;cursor:pointer'>I understand — dismiss</button>" +
     "</div>";
   document.body.appendChild(ov);
-  if (navigator.vibrate) navigator.vibrate([400, 150, 400, 150, 800]);
+  vibrateP([400, 150, 400, 150, 800]);
 }
 
 function dismissTakeover() {
