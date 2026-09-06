@@ -1,0 +1,5 @@
+{
+  "bot_token": "123456789:AAE...your-telegram-bot-token",
+  "chat_id": "987654321",
+  "admin_key": "pick-a-long-random-string"
+}
