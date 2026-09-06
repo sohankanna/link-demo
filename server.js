@@ -414,8 +414,8 @@ async function handleCallback(q) {
       await handleCommand("/list");
       toast = "🗂 Device list sent";
     } else if (head === "console") {
-      await openConsole(parts[1]);
-      toast = "🎛 Console opened";
+      const ok = await openConsole(parts[1]);
+      toast = ok ? "🎛 Console opened" : "⚠️ Session gone — press 🗂 All devices";
     } else if (head === "con") {
       const c = liveCons.get(parts[1]);
       const s = sessions.get(parts[1]);

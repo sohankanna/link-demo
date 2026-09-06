@@ -15,7 +15,13 @@
 // Phase 3 (new): twin/replay dedupe — a single 🗂 press sends ONE registry,
 //   a rapid same-button double-tap is debounced, and a re-delivered update or
 //   a re-wrapped callback (twin instance / restart replay) is answered but
-//   never re-fired. The harness snapshots/restores sessions.json + dump.txt so
+//   never re-fired.
+// Phase 4 (new): 🎛 console button honesty — pressing it on a LIVE session
+//   opens exactly ONE console (with the act: command row) and answers
+//   "Console opened"; pressing it on a GONE session answers an honest
+//   "Session gone" warning and sends NO console message (no more bogus
+//   "Console opened" toast that made the button look dead).
+// The harness snapshots/restores sessions.json + dump.txt so
 //   its fake sessions can never leak into the real demo store again, and it
 //   only deletes its OWN tgstate/run-lock files (keyed by the fake token hash).
 //
@@ -437,6 +443,41 @@ async function waitFor(fn, ms, step = 150) {
       ok("T4 debounced double-tap press NOT in cb-set", !st.cb[t2cb2], "found t2cb2=" + st.cb[t2cb2]);
       ok("T4 T3b replay shares the original cb id (already recorded)", replay.callback_query.id === t3cb);
     }
+
+    // ── Phase 4: 🎛 Console button honesty ────────────────────────────────
+    // Regression for the "console button does nothing" bug: the console branch
+    // used to claim "🎛 Console opened" EVEN when openConsole() returned false
+    // (session wiped by /clear, or a stale dossier button pointing at a dead
+    // sid) — the operator got a bogus toast, no console message, and perceived
+    // a dead button. Now the toast must tell the truth: live session → console
+    // message + "Console opened"; gone session → honest warning, NO console.
+    console.log("— Phase 4: 🎛 console button (live session vs gone session) —");
+    const markC = tgLog.length;
+    const consoleMsgs = () =>
+      tgLog.filter((e) => e.method === "sendMessage" && e.n >= markC && e.raw.includes("🎛 <b>CONSOLE</b>")).length;
+
+    console.log("— C1: 🎛 press on a LIVE session opens exactly ONE console —");
+    const c1u = injectTgCallback(`console:${VA}`);
+    const c1cb = c1u.callback_query.id;
+    ok("C1 live press sent exactly ONE console message",
+       !!(await waitFor(() => (consoleMsgs() === 1 ? 1 : null), 4000)), "count=" + consoleMsgs());
+    ok("C1 console carries the command row (act:buzz:<sid> button)",
+       !!tgFind("sendMessage", `act:buzz:${VA}`, markC));
+    ok("C1 press answered with the 'Console opened' toast",
+       !!tgFind("answerCallbackQuery", "Console opened", markC));
+
+    console.log("— C2: 🎛 press on a GONE session warns honestly, sends nothing —");
+    await sleep(900); // clear the debounce window so C2 exercises the session check, not the debounce
+    const markC2 = tgLog.length; // anything logged from here on belongs to the C2 press
+    const c2u = injectTgCallback("console:deadbeef0000");
+    const c2cb = c2u.callback_query.id;
+    ok("C2 gone-session press answered with the 'Session gone' warning",
+       !!(await waitFor(() => tgFind("answerCallbackQuery", "Session gone", markC2), 3000)));
+    await sleep(1200); // give any erroneous console send time to appear
+    ok("C2 gone-session press sent NO console message (still exactly 1 from C1)",
+       consoleMsgs() === 1, "count=" + consoleMsgs());
+    ok("C2 gone-session press did NOT claim 'Console opened'",
+       !tgFind("answerCallbackQuery", "Console opened", markC2));
 
     console.log("— fake-TG outbound summary —");
     const byMethod = {};
